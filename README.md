@@ -4,7 +4,7 @@ This is another ttf2gui based on https://github.com/deividAlfa/ttf2ugui with mod
 2. fixed the show function for CJK.
 3. Add new Flags for ranges of font data.
 4. Anything more??No...Playing this is just for fun~~
-
+<img src="./ttf2ugui.png" width="600">
 ##### Standard ASCII , ©,cyrillic, CJK punctuations , Common Chinese characters , full-width ASCII characters:<br>
 ```./ttf2ugui --font=SourceHanSansCN_Medium.otf --dpi=75 --size=12 --dump --char=32-126,169,1042-1103,8208-8303,12289-12329,19968-40943,65281-65374 --show="你好，世界！"```
 
