@@ -121,18 +121,22 @@ typedef enum
 
 typedef struct
 {
-   FONT_TYPE    font_type;
-   UG_U8        is_old_font;                      // This exists to maintain compatibility with old fonts, as they use code page 850 instead of Unicode
-   UG_U8        char_width;
-   UG_U8        char_height;
-   UG_U16       bytes_per_char;
-   UG_U16       number_of_chars;
-   UG_U16       number_of_offsets;
-   const UG_U8  * widths;
-   const UG_U8  * offsets;
-   const UG_U8  * data;
-   UG_FONT      * font;
+    FONT_TYPE    font_type;
+    UG_U8        is_old_font;                      // This exists to maintain compatibility with old fonts, as they use code page 850 instead of Unicode
+    UG_U8        char_width;
+    UG_U8        char_height;
+    UG_U16       bytes_per_char;
+    UG_U16       number_of_chars;
+    UG_U16       number_of_offsets;
+	UG_U16       number_of_range_flags;
+    const UG_U8  *widths;
+    const UG_U8  *offsets;
+    const UG_U8  *range_flags;                     // Pointer to range flags array
+    const UG_U8  *data;
+    UG_FONT      *font;
 } UG_FONT_DATA;
+
+
 
 #ifdef UGUI_USE_UTF8
 typedef UG_U16                                        UG_CHAR;
@@ -404,6 +408,12 @@ typedef struct
 
 #define UG_STATUS_WAIT_FOR_UPDATE                     (1<<0)
 
+//#include "ugui_button.h"
+//#include "ugui_checkbox.h"
+//#include "ugui_fonts.h"
+//#include "ugui_image.h"
+//#include "ugui_progress.h"
+//#include "ugui_textbox.h"
 /* -------------------------------------------------------------------------------- */
 /* -- PROTOTYPES                                                                 -- */
 /* -------------------------------------------------------------------------------- */
@@ -416,7 +426,7 @@ void UG_FontSelect( UG_FONT* font );
 void UG_FillScreen( UG_COLOR c );
 void UG_FillFrame( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_COLOR c );
 void UG_FillRoundFrame( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_S16 r, UG_COLOR c );
-void UG_DrawMesh( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_COLOR c );
+void UG_DrawMesh( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_U16 spacing, UG_COLOR c );
 void UG_DrawFrame( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_COLOR c );
 void UG_DrawRoundFrame( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_S16 r, UG_COLOR c );
 void UG_DrawPixel( UG_S16 x0, UG_S16 y0, UG_COLOR c );
@@ -441,6 +451,7 @@ UG_S16 UG_GetYDim( void );
 void UG_FontSetHSpace( UG_U16 s );
 void UG_FontSetVSpace( UG_U16 s );
 void UG_FontSetTransparency( UG_U8 t );
+UG_U8 UG_FontGetTransparency( void );
 
 /* Miscellaneous functions */
 void UG_WaitForUpdate( void );

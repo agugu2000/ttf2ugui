@@ -1,3 +1,14 @@
+This is another form based on https://github.com/deividAlfa/UGUI with modifications:
+
+1. Limited modification: now the single character range for font conversion is invalid. The font range must appear in pairs, such as 0X20-0XFF. It is not allowed to convert only one character like 0x20 for use(although you can do the conversion,pointer does not skip+1 while it meets single string in Ugui).
+2. Add new Flags for ranges of font data.
+
+##### Standard ASCII , cyrillic, CJK punctuations , Common Chinese characters , full-width ASCII characters:<br>
+```./ttf2ugui --font=SourceHanSansCN-Medium.otf --dpi=75 --size=12 --dump --char=32-126,1042-1103,8208-8303,12289-12329,19968-40943,65281-65374```
+
+
+deividalfa's ttf2ugui
+========
 This is my version of [ttf2gui](https://github.com/AriZuu/ttf2ugui), modified for my [uGUI](https://github.com/deividalfa/UGUI) fork.<br>
 Adds UTF8 compatibility and supports the custom font structure used in my uGUI version.<br>
 Not compatible with the original!<br>
