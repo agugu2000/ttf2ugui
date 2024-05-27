@@ -1,12 +1,12 @@
-This is another ttf2gui based on [https://github.com/deividAlfa/UGUI](https://github.com/deividAlfa/ttf2ugui) with modifications:
+This is another ttf2gui based on https://github.com/deividAlfa/ttf2ugui with modifications:
 
 1. now the single character range for font conversion will be repeated for setting a clear range.like:unicode 169 has an offset:0x00,0xA9,0x00,0xA9 Flag:0x01,0x00
 2. fixed the show function for CJK.
 3. Add new Flags for ranges of font data.
 4. Anything more??No...Playing this is just for fun~~
 
-##### Standard ASCII , cyrillic, CJK punctuations , Common Chinese characters , full-width ASCII characters:<br>
-```./ttf2ugui --font=SourceHanSansCN-Medium.otf --dpi=75 --size=12 --dump --char=32-126,1042-1103,8208-8303,12289-12329,19968-40943,65281-65374```
+##### Standard ASCII , ©,cyrillic, CJK punctuations , Common Chinese characters , full-width ASCII characters:<br>
+```./ttf2ugui --font=SourceHanSansCN_Medium.otf --dpi=75 --size=12 --dump --char=32-126,169,1042-1103,8208-8303,12289-12329,19968-40943,65281-65374 --show="你好，世界！"```
 
 
 deividalfa's ttf2ugui
