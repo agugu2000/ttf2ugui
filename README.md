@@ -10,6 +10,16 @@ This is another ttf2gui based on https://github.com/deividAlfa/ttf2ugui with mod
 <img src="./ttf2ugui.png" width="600">
 
 
+##### Use it in Windows
+You can use the tool without any additional operations,but if you wanna see a right unicode previews with --show="xxxx".Turn on the utf8 support in Windows:
+1. Open the "Control Panel" (you can search for "Control Panel" in the Start menu).
+2. Click on "Clock and Region" (or "Region").
+3. Click on the "Region" option.
+4. In the window that pops up, select the "Administrative" tab.
+5. Click the "Change system locale" button.
+6. In the new dialog box, check the option "Beta: Use Unicode UTF-8 for worldwide language support (U)".
+7. Click "OK", and you may need to restart your computer.
+
 
 deividalfa's ttf2ugui
 ========
