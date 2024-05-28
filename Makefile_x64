@@ -5,9 +5,9 @@ TARGET=ttf2ugui.exe
 SOURCES=ttf2ugui.c ugui.c
 OBJECTS=$(SOURCES:.c=.o)
 
-# change your path here
+# change your path here or drop the freetype sourcecode folder in the same directory as ttf2ugui.c
 CFLAGS=-I".\freetype-2.13.2\include"
-# change your path here
+# change your path here or drop the freetype sourcecode folder in the same directory as ttf2ugui.c
 LDFLAGS=-L".\freetype-2.13.2\lib" -lfreetype
 
 all: $(TARGET)
