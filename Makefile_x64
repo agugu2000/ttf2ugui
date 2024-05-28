@@ -1,0 +1,24 @@
+# Makefile for ttf2ugui on Windows using MinGW
+
+CC=gcc
+TARGET=ttf2ugui.exe
+SOURCES=ttf2ugui.c ugui.c
+OBJECTS=$(SOURCES:.c=.o)
+
+# change your path here
+CFLAGS=-I".\freetype-2.13.2\include"
+# change your path here
+LDFLAGS=-L".\freetype-2.13.2\lib" -lfreetype
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) -c $(CFLAGS) $< -o $@
+
+clean:
+	del $(OBJECTS) $(TARGET)
+
+.PHONY: all clean
