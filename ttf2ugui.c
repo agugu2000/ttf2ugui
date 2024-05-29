@@ -443,222 +443,231 @@ static void dumpFont(UG_FONT_DATA_RAM * font, const char* fontFile, float fontSi
 
 static UG_FONT_DATA_RAM newFont;
 
-static UG_FONT_DATA_RAM *convertFont(const char *font, int dpi, float fontSize,int bitsPerPixel)
+static UG_FONT_DATA_RAM *convertFont(const char *font, int dpi, float fontSize, int bitsPerPixel)
 {
-  int     error;
-  FT_Face   face;
-  FT_Library   library;
-  int     bpp_mul;
+    int error;
+    FT_Face face;
+    FT_Library library;
+    int bpp_mul;
 
-
-  switch(bitsPerPixel)
-  {
-    case 1: bpp_mul = 1; break;
-    case 8: bpp_mul = 16; break;
-    default:
+    switch (bitsPerPixel)
     {
-       fprintf(stderr, "Bits per pixel must be 1 or 8, not %d!!\n", bitsPerPixel);
-       exit(1);
-    }break;
-
-  }
-
-/*
- * Initialize freetype library, load the font
- * and set output character size.
- */
-  error = FT_Init_FreeType(&library);
-  if (error) {
-
-    fprintf(stderr, "ft init err %d\n", error);
-    exit(1);
-  }
-
-  error = FT_New_Face(library,
-                      font,
-                      0,
-                      &face);
-  if (error) {
-
-    fprintf(stderr, "ew faceerr %d\n", error);
-    exit(1);
-  }
-
-/*
- * If DPI is not given, use pixes to specify the size.
- */
-  if (dpi > 0)
-    error = FT_Set_Char_Size(face, 0, fontSize * 64 * bpp_mul, dpi, dpi);
-  else
-    error = FT_Set_Pixel_Sizes(face, 0, fontSize * bpp_mul);
-  if (error) {
-
-    fprintf(stderr, "set pixel sizes err %d\n", error);
-    exit(1);
-  }
-  
-  
-  parse_chars(charArg);
-  
-
-  int i, j,i_idx,j_idx;
-  int coverage;
-  uint32_t ch;
-  int maxWidth = 0;
-  int maxHeight = 0;
-  int maxAscent = 0;
-  int maxDescent = 0;
-  int bytesPerChar;
-  int bytesPerRow;
-
-/*
- * First found out how big character bitmap is needed. Every character
- * must fit into it so that we can obtain correct character positioning.
- */
-  for (ch = 0; ch <charCount; ch++) {
-
-    int ascent;
-    int descent;
-  if(!chars[ch]){
-    fprintf(stderr, "No chars defined %d\n", error);
-    exit(1);
-  }
-    error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
-    if (error) {
-
-      fprintf(stderr, "load char err %d\n", error);
-      exit(1);
+		case 1:
+			bpp_mul = 1;break;
+			break;
+		case 8:
+			bpp_mul = 1;break;
+			break;
+		default:
+		{
+			fprintf(stderr, "Bits per pixel must be 1 or 8, not %d!!\n", bitsPerPixel);
+			exit(1);
+		}
+		break;
     }
 
-    descent = max(0, face->glyph->bitmap.rows - face->glyph->bitmap_top);
-    ascent = max(0, max(face->glyph->bitmap_top, face->glyph->bitmap.rows) - descent);
+    // Initialize freetype library, load the font and set output character size.
+    error = FT_Init_FreeType(&library);
+    if (error)
+    {
+        fprintf(stderr, "ft init err %d\n", error);
+        exit(1);
+    }
 
-    if (descent > maxDescent)
-      maxDescent = descent;
+    error = FT_New_Face(library, font, 0, &face);
+    if (error)
+    {
+        fprintf(stderr, "new face err %d\n", error);
+        exit(1);
+    }
 
-    if (ascent > maxAscent)
-      maxAscent = ascent;
+    // If DPI is not given, use pixels to specify the size.
+    if (dpi > 0)
+        error = FT_Set_Char_Size(face, 0, fontSize * 64, dpi, dpi);
+    else
+        error = FT_Set_Pixel_Sizes(face, 0, fontSize);
+    if (error)
+    {
+        fprintf(stderr, "set pixel sizes err %d\n", error);
+        exit(1);
+    }
 
-    if (face->glyph->bitmap.width > maxWidth)
-      maxWidth = face->glyph->bitmap.width;
-  }
+    parse_chars(charArg);
 
-  maxWidth = maxWidth / bpp_mul;
-  maxHeight = (maxAscent + maxDescent) / bpp_mul;
+    int i, j, i_idx, j_idx;
+    int coverage;
+    uint32_t ch;
+    int maxWidth = 0;
+    int maxHeight = 0;
+    int maxAscent = 0;
+    int maxDescent = 0;
+    int bytesPerChar;
+    int bytesPerRow;
 
-  switch(bitsPerPixel)
-  {
+    // First found out how big character bitmap is needed. Every character must fit into it so that we can obtain correct character positioning.
+    for (ch = 0; ch < charCount; ch++)
+    {
+        int ascent;
+        int descent;
+        if (!chars[ch])
+        {
+            fprintf(stderr, "No chars defined %d\n", error);
+            exit(1);
+        }
+        
+        if(bitsPerPixel == 8) {
+			error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL);
+		}
+		else {
+			error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
+		}
+		
+        if (error)
+        {
+            fprintf(stderr, "load char err %d\n", error);
+            exit(1);
+        }
+
+        descent = max(0, face->glyph->bitmap.rows - face->glyph->bitmap_top);
+        ascent = max(0, max(face->glyph->bitmap_top, face->glyph->bitmap.rows) - descent);
+
+        if (descent > maxDescent)
+            maxDescent = descent;
+
+        if (ascent > maxAscent)
+            maxAscent = ascent;
+
+        if (face->glyph->bitmap.width > maxWidth)
+            maxWidth = face->glyph->bitmap.width;
+    }
+
+    maxWidth = maxWidth / bpp_mul;
+    maxHeight = (maxAscent + maxDescent) / bpp_mul;
+
+    switch (bitsPerPixel)
+    {
     case 1:
     {
         // Round up to full bytes
-        bytesPerRow = (maxWidth +7 )/ 8;
-    }break;
+        bytesPerRow = (maxWidth + 7) / 8;
+    }
+    break;
 
     case 8:
     {
         bytesPerRow = maxWidth;
-    }break;
-  }
-
-
-  bytesPerChar = bytesPerRow * maxHeight;
-  newFont.data = calloc(1, bytesPerChar * charCount);
-  newFont.number_of_offsets = offsetCount;
-  newFont.offsets = offsets;
-  newFont.range_flags = malloc(offsetCount); 
-  memcpy(newFont.range_flags, range_flags, offsetCount); 
-  newFont.number_of_range_flags = offsetCount;
-
-  
-  switch(bitsPerPixel)
-  {
-        case 1: newFont.font_type = FONT_TYPE_1BPP; break;
-        case 8: newFont.font_type = FONT_TYPE_8BPP; break;
-  }
-
-  newFont.char_width  = maxWidth;
-  newFont.char_height = maxHeight;
-  newFont.bytes_per_char = bytesPerChar;
-  newFont.number_of_chars = charCount;
-  newFont.widths      = malloc(charCount);
-
-/*
- * Render each character.
- */
-  for (ch = 0; ch <charCount; ch++) {
-
-    error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
-    if (error) {
-
-      fprintf(stderr, "load char err %d\n", error);
-      exit(1);
+    }
+    break;
     }
 
-    for (i = 0; i < face->glyph->bitmap.rows / bpp_mul; i++)
-      for (j = 0; j < face->glyph->bitmap.width / bpp_mul; j++) {
+    bytesPerChar = bytesPerRow * maxHeight;
+    newFont.data = calloc(1, bytesPerChar * charCount);
+    newFont.number_of_offsets = offsetCount;
+    newFont.offsets = offsets;
+    newFont.range_flags = malloc(offsetCount);
+    memcpy(newFont.range_flags, range_flags, offsetCount);
+    newFont.number_of_range_flags = offsetCount;
 
-        coverage = 0;
+    switch (bitsPerPixel)
+    {
+    case 1:
+        newFont.font_type = FONT_TYPE_1BPP;
+        break;
+    case 8:
+        newFont.font_type = FONT_TYPE_8BPP;
+        break;
+    }
 
-        for(i_idx =0; i_idx < bpp_mul;i_idx++) {
-            for(j_idx = 0; j_idx < bpp_mul;j_idx++) {
+    newFont.char_width = maxWidth;
+    newFont.char_height = maxHeight;
+    newFont.bytes_per_char = bytesPerChar;
+    newFont.number_of_chars = charCount;
+    newFont.widths = malloc(charCount);
 
-
-                uint8_t *bits = (uint8_t *) face->glyph->bitmap.buffer;
-                uint8_t b = bits[(i*bpp_mul+i_idx) * face->glyph->bitmap.pitch + ((j*bpp_mul+j_idx) / 8)];
-
-
-                if (b & (1 << (7 - ((j*bpp_mul+j_idx) % 8))))
-                {
-                    coverage ++;
-                }
-
-            }
-        }
-
-
-        /*
-         * Output character to correct position in bitmap
-         */
-
-        int xpos, ypos,ind;
-
-        xpos = j + (face->glyph->bitmap_left / bpp_mul);
-        ypos = (maxAscent/bpp_mul) + i - (face->glyph->bitmap_top / bpp_mul);
-
-
-        switch(bitsPerPixel)
+    // Render each character.
+    for (ch = 0; ch < charCount; ch++) {
+        if(bitsPerPixel == 8) {
+			error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL);
+		}
+		else {
+			error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
+		}
+        if (error)
         {
-
-            case 1:
-            {
-
-                ind = ypos * bytesPerRow;
-                ind += xpos / 8;
-
-
-                if (coverage !=0)
-                    newFont.data[(ch * bytesPerChar) + ind] |= (1 << ((xpos % 8)));
-            }break;
-
-            case 8:
-            {
-                ind = ypos * bytesPerRow;
-                ind += xpos ;
-
-                newFont.data[(ch * bytesPerChar) + ind  ] = (255 * coverage)/256; // need to be 0..255 range
-
-            }break;
+            fprintf(stderr, "load char err %d\n", error);
+            exit(1);
         }
-      }
 
-    /*
-     * Save character width, freetype uses 1/64 as units for it.
-     */
-    newFont.widths[ch] = (face->glyph->advance.x >> 6) / bpp_mul;
+        for (i = 0; i < face->glyph->bitmap.rows / bpp_mul; i++) 
+            for (j = 0; j < face->glyph->bitmap.width / bpp_mul; j++)
+            {
+                coverage = 0;
 
-  }
+                for (i_idx = 0; i_idx < bpp_mul; i_idx++)
+                {
+                    for (j_idx = 0; j_idx < bpp_mul; j_idx++)
+                    {
+                        uint8_t *bits = (uint8_t *)face->glyph->bitmap.buffer;
+                        
+						if(bitsPerPixel == 8) {
+							
+							uint8_t b = bits[(i * bpp_mul + i_idx) * face->glyph->bitmap.pitch + (j * bpp_mul + j_idx)];
+							if (b)
+							{
+								coverage += b;
+							}
+						}
+						else {
+							uint8_t b = bits[(i*bpp_mul+i_idx) * face->glyph->bitmap.pitch + ((j*bpp_mul+j_idx) / 8)];
+							if (b & (1 << (7 - ((j*bpp_mul+j_idx) % 8))))
+							{
+								coverage ++;
+							}
+						}
+					}
+				}
+			
+		
+	
 
-  return &newFont;
+                // Output character to correct position in bitmap
+                int xpos, ypos, ind;
+
+                xpos = j + (face->glyph->bitmap_left / bpp_mul);
+                ypos = (maxAscent / bpp_mul) + i - (face->glyph->bitmap_top / bpp_mul);
+
+                if (xpos >= 0 && xpos < maxWidth && ypos >= 0 && ypos < maxHeight)
+                {
+                    switch (bitsPerPixel)
+                    {
+                    case 1:
+                    {
+                        ind = ypos * bytesPerRow;
+                        ind += xpos / 8;
+
+                        if (coverage != 0)
+                            newFont.data[(ch * bytesPerChar) + ind] |= (1 << ((xpos % 8)));
+                    }
+                    break;
+
+                    case 8:
+                    {
+                        ind = ypos * bytesPerRow;
+                        ind += xpos;
+						
+						if (coverage !=0)
+                        newFont.data[(ch * bytesPerChar) + ind] = coverage / (bpp_mul * bpp_mul);
+                    }
+                    break;
+                    }
+                }
+            }
+
+        // Save character width, freetype uses 1/64 as units for it.
+        newFont.widths[ch] = (face->glyph->advance.x >> 6) / bpp_mul;
+    }
+
+    return &newFont;
 }
 
 /*
