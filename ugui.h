@@ -146,7 +146,8 @@ typedef enum
  *     6-9 number_of_chars 4-byte big-endian
  *    10-13 total_size  4-byte big-endian
  *    14-15 notdef_adv  2-byte big-endian
- *    16-19 reserved
+ *    16-17 ascender     2-byte big-endian, signed
+ *    18-19 descender    2-byte big-endian, signed
  *   [codepoints:    number_of_chars * 2B BE, ascending]
  *   [metrics:       number_of_chars * 10B]
  *                     w(2), h(2), x_off(int16), y_off(int16), adv(2)
@@ -190,6 +191,8 @@ typedef struct
     UG_U16 max_ink_w;
     UG_U16 max_ink_h;
     UG_U16 notdef_adv;    /* advance for missing glyphs, from font's .notdef */
+    UG_S16 ascender;      /* baseline to line top, positive */
+    UG_S16 descender;     /* baseline to line bottom, usually negative */
     UG_U32 number_of_chars;
     UG_U32 total_size;
     const UG_U8 *codepoints;

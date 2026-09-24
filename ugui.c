@@ -72,6 +72,8 @@ UG_S16 UG_Init( UG_GUI* g, UG_DEVICE *device )
    g->currentFont.max_ink_w = 0;
    g->currentFont.max_ink_h = 0;
    g->currentFont.notdef_adv = 0;
+   g->currentFont.ascender = 0;
+   g->currentFont.descender = 0;
    g->currentFont.number_of_chars = 0;
    g->currentFont.total_size = 0;
    g->currentFont.codepoints = NULL;
@@ -551,12 +553,19 @@ void UG_PutString( UG_S16 x, UG_S16 y, char* str )
    UG_GLYPH g;
    UG_S16 line_h;
 
+   _UG_FontSelect(gui->font);
+
+   /* Industry standard: line height = ascender - descender */
+   line_h = (UG_S16)gui->currentFont.ascender
+          - (UG_S16)gui->currentFont.descender;
+   if (line_h <= 0) line_h = 1;
+
    xp=x; yp=y;
 
-   _UG_FontSelect(gui->font);
-   line_h = (gui->currentFont.format == UG_FONT_FMT_NEW)
-          ? (UG_S16)gui->currentFont.max_ink_h
-          : (UG_S16)gui->currentFont.old_char_height;
+   if (gui->currentFont.format == UG_FONT_FMT_NEW) {
+      yp += (UG_S16)gui->currentFont.ascender;   /* line top -> baseline */
+   }
+   /* Old format: keep yp = y (line top), y_off = 0 */
 
    while ( *str != 0 )
    {
@@ -610,11 +619,13 @@ void UG_ConsolePutString( char* str )
    UG_CHAR chr;
    UG_GLYPH g;
    UG_S16 line_h;
+   UG_S16 y_draw;
 
    _UG_FontSelect(gui->font);
-   line_h = (gui->currentFont.format == UG_FONT_FMT_NEW)
-          ? (UG_S16)gui->currentFont.max_ink_h
-          : (UG_S16)gui->currentFont.old_char_height;
+   /* Industry standard: line height = ascender - descender */
+   line_h = (UG_S16)gui->currentFont.ascender
+          - (UG_S16)gui->currentFont.descender;
+   if (line_h <= 0) line_h = 1;
 
    while ( *str != 0 )
    {
@@ -654,7 +665,11 @@ void UG_ConsolePutString( char* str )
          UG_FillFrame(gui->console.x_start,gui->console.y_start,gui->console.x_end,gui->console.y_end,gui->console.back_color);
       }
 
-      _UG_PutGlyph(&g, gui->console.x_pos, gui->console.y_pos, gui->console.fore_color, gui->console.back_color, gui->transparent_font);
+      y_draw = gui->console.y_pos;
+      if (gui->currentFont.format == UG_FONT_FMT_NEW) {
+         y_draw += (UG_S16)gui->currentFont.ascender;
+      }
+      _UG_PutGlyph(&g, gui->console.x_pos, y_draw, gui->console.fore_color, gui->console.back_color, gui->transparent_font);
    }
    if((gui->driver[DRIVER_FILL_AREA].state & DRIVER_ENABLED))
      ((void*(*)(UG_S16, UG_S16, UG_S16, UG_S16))gui->driver[DRIVER_FILL_AREA].driver)(-1,-1,-1,-1);
@@ -887,6 +902,11 @@ void _UG_FontSelect(UG_FONT *font) {
         gui->currentFont.old_char_width  = p[1];
         gui->currentFont.old_char_height = p[2];
         gui->currentFont.notdef_adv = gui->currentFont.old_char_width;
+
+        /* Old format: cell model, line height = cell height */
+        gui->currentFont.ascender  = (UG_S16)gui->currentFont.old_char_height;
+        gui->currentFont.descender = 0;
+
         gui->currentFont.old_number_of_chars   = (UG_U16)((p[3] << 8) | p[4]);
         gui->currentFont.old_number_of_offsets = (UG_U16)((p[5] << 8) | p[6]);
         gui->currentFont.old_bytes_per_char    = (UG_U16)((p[9] << 8) | p[10]);
@@ -910,6 +930,11 @@ void _UG_FontSelect(UG_FONT *font) {
         gui->currentFont.max_ink_w = (UG_U16)((p[2] << 8) | p[3]);
         gui->currentFont.max_ink_h = (UG_U16)((p[4] << 8) | p[5]);
         gui->currentFont.notdef_adv = (UG_U16)((p[14] << 8) | p[15]);
+
+        /* Industry standard: ascender / descender (always present in regenerated fonts) */
+        gui->currentFont.ascender  = (UG_S16)((p[16] << 8) | p[17]);
+        gui->currentFont.descender = (UG_S16)((p[18] << 8) | p[19]);
+
         gui->currentFont.number_of_chars = ((UG_U32)p[6] << 24) | ((UG_U32)p[7] << 16) |
                                            ((UG_U32)p[8] << 8) | (UG_U32)p[9];
         gui->currentFont.total_size = ((UG_U32)p[10] << 24) | ((UG_U32)p[11] << 16) |
@@ -1323,12 +1348,13 @@ void _UG_PutText(UG_TEXT* txt)
 
    UG_S16 ye=txt->a.ye;
    UG_S16 ys=txt->a.ys;
-   UG_S16 char_height;
 
    _UG_FontSelect(txt->font);
-   char_height = (gui->currentFont.format == UG_FONT_FMT_NEW)
-               ? (UG_S16)gui->currentFont.max_ink_h
-               : (UG_S16)gui->currentFont.old_char_height;
+   /* Industry standard: line height = ascender - descender */
+   UG_S16 char_height = (UG_S16)gui->currentFont.ascender
+                      - (UG_S16)gui->currentFont.descender;
+
+   if (char_height <= 0) return;
 
    if ( (ye - ys) < char_height ){
      return;
@@ -1377,6 +1403,11 @@ void _UG_PutText(UG_TEXT* txt)
    }
    if ( align & ALIGN_V_CENTER ) yp >>= 1;
    yp += ys;
+
+   /* New format: line top -> baseline. Old format: keep line top (y_off = 0). */
+   if (gui->currentFont.format == UG_FONT_FMT_NEW) {
+      yp += (UG_S16)gui->currentFont.ascender;
+   }
 
    while( 1 )
    {

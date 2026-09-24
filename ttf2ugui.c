@@ -38,6 +38,8 @@
  *   header(20) + codepoints + metrics + data_offsets + data
  *
  * Each glyph has its own ink w/h, x_off, y_off, adv.
+ * The font also carries ascender / descender in the header,
+ * used by the renderer to position the baseline.
  * Bitmap stored tight (no cell, no padding).
  * Binary search over codepoints.
  *
@@ -207,7 +209,8 @@ static void list_faces(const char *path)
 }
 
 static void convert_font(const char *path, CpVec *cps, Glyph **out,
-                         uint16_t *omw, uint16_t *omh, uint16_t *onotdef_adv)
+                         uint16_t *omw, uint16_t *omh, uint16_t *onotdef_adv,
+                         int16_t *oascender, int16_t *odescender)
 {
     FT_Library lib; FT_Face face; FT_Error err;
     if ((err = FT_Init_FreeType(&lib))) { fprintf(stderr, "FT init %d\n", err); exit(1); }
@@ -246,6 +249,10 @@ static void convert_font(const char *path, CpVec *cps, Glyph **out,
     if (dpi > 0) err = FT_Set_Char_Size(face, 0, (FT_F26Dot6)(fontSize * 64.0f), dpi, dpi);
     else         err = FT_Set_Pixel_Sizes(face, 0, (FT_UInt)fontSize);
     if (err) { fprintf(stderr, "FT size %d\n", err); exit(1); }
+
+    /* Industry standard: font-wide metrics (read after FT_Set_*_Size) */
+    int16_t ascender  = (int16_t)(face->size->metrics.ascender  >> 6);
+    int16_t descender = (int16_t)(face->size->metrics.descender >> 6);
 
     /* Load .notdef to get its advance, used as placeholder for missing glyphs */
     uint16_t notdef_adv = 0;
@@ -338,6 +345,8 @@ static void convert_font(const char *path, CpVec *cps, Glyph **out,
     *omw         = maxw;
     *omh         = maxh;
     *onotdef_adv = notdef_adv;
+    *oascender   = ascender;
+    *odescender  = descender;
 }
 
 /* ------------------------------------------------------------------ */
@@ -425,7 +434,8 @@ static char *sanitize_alloc(const char *path)
 /* ------------------------------------------------------------------ */
 
 static void dump_font(const char *path, CpVec *cps, Glyph *gs,
-                      uint16_t maxw, uint16_t maxh, uint16_t notdef_adv)
+                      uint16_t maxw, uint16_t maxh, uint16_t notdef_adv,
+                      int16_t ascender, int16_t descender)
 {
     char *base = sanitize_alloc(path);
 
@@ -466,7 +476,8 @@ static void dump_font(const char *path, CpVec *cps, Glyph *gs,
     fprintf(o, "//     [6-9]    number_of_chars 4-byte big-endian\n");
     fprintf(o, "//     [10-13]  total_size      4-byte big-endian\n");
     fprintf(o, "//     [14-15]  notdef_adv      2-byte big-endian\n");
-    fprintf(o, "//     [16-19]  reserved, must be 0\n");
+    fprintf(o, "//     [16-17]  ascender        2-byte big-endian, signed\n");
+    fprintf(o, "//     [18-19]  descender       2-byte big-endian, signed\n");
     fprintf(o, "//   [codepoints:   n * 2 bytes, 2-byte big-endian, ascending]\n");
     fprintf(o, "//   [metrics:      n * 10 bytes, each field 2-byte big-endian]\n");
     fprintf(o, "//                  w(2) h(2) x_off(2 signed) y_off(2 signed) adv(2)\n");
@@ -505,8 +516,13 @@ static void dump_font(const char *path, CpVec *cps, Glyph *gs,
     fprintf(o, "  /* [14-15]  notdef_adv: 2-byte big-endian                        */\n");
     fprintf(o, "  0x%02X,0x%02X,\n", (notdef_adv >> 8) & 0xFF, notdef_adv & 0xFF);
 
-    fprintf(o, "  /* [16-19]  reserved, must be 0                                  */\n");
-    fprintf(o, "  0x00,0x00,0x00,0x00,\n");
+    fprintf(o, "  /* [16-17]  ascender: 2-byte big-endian, signed                  */\n");
+    fprintf(o, "  0x%02X,0x%02X,\n",
+            ((uint16_t)ascender >> 8) & 0xFF, (uint16_t)ascender & 0xFF);
+
+    fprintf(o, "  /* [18-19]  descender: 2-byte big-endian, signed                 */\n");
+    fprintf(o, "  0x%02X,0x%02X,\n",
+            ((uint16_t)descender >> 8) & 0xFF, (uint16_t)descender & 0xFF);
 
     /* ---------------- codepoints ---------------- */
     fprintf(o, "\n");
@@ -973,7 +989,9 @@ int main(int argc, char **argv)
 
     Glyph *gs = NULL;
     uint16_t maxw = 0, maxh = 0, notdef_adv = 0;
-    convert_font(opt_font, &cps, &gs, &maxw, &maxh, &notdef_adv);
+    int16_t ascender = 0, descender = 0;
+    convert_font(opt_font, &cps, &gs, &maxw, &maxh, &notdef_adv,
+                 &ascender, &descender);
 
     sort_cps_glyphs(&cps, gs);
 
@@ -981,7 +999,8 @@ int main(int argc, char **argv)
         render_preview(&cps, gs, maxh, opt_text, "preview.bmp");
 
     if (opt_dump)
-        dump_font(opt_font, &cps, gs, maxw, maxh, notdef_adv);
+        dump_font(opt_font, &cps, gs, maxw, maxh, notdef_adv,
+                  ascender, descender);
 
     for (uint32_t i = 0; i < cps.n; i++) free(gs[i].bitmap.p);
     free(gs);
