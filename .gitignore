@@ -3,3 +3,5 @@ ttf2ugui
 *.BAK
 *.ttf
 *.otf
+
+build/

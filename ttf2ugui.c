@@ -33,707 +33,959 @@
   *
   */
 
+/*
+ * New format (math-correct glyph model):
+ *   header(20) + codepoints + metrics + data_offsets + data
+ *
+ * Each glyph has its own ink w/h, x_off, y_off, adv.
+ * Bitmap stored tight (no cell, no padding).
+ * Binary search over codepoints.
+ *
+ * CLI:
+ *   --font=FILE --size=N [--dpi=N] [--bpp=1|8] [--chars=LIST]
+ *   [--dump] [--preview --text=TEXT]
+ *
+ *   --preview writes preview.bmp (512x512, 8bpp indexed) into the
+ *   current working directory (same place as the generated .c).
+ */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
 #include <getopt.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_MULTIPLE_MASTERS_H
 
-#define SCREEN_WIDTH 132
-#define SCREEN_HEIGHT 40
 #include "ugui.h"
 
-static void drawPixel(UG_S16 x, UG_S16 y, UG_COLOR col);
+#define DEFAULT_CHARS  "32-126"
+#define MAX_GLYPH_W    4096
+#define MAX_GLYPH_H    4096
+#define MAX_BEARING    32767
 
-static UG_GUI gui;
-static UG_DEVICE device = {
-    .x_dim = SCREEN_WIDTH,
-    .y_dim = SCREEN_HEIGHT,
-    .pset = drawPixel,
-};
+#define PREVIEW_W      512
+#define PREVIEW_H      512
+
+typedef struct { uint16_t *cp; uint32_t n, cap; } CpVec;
+typedef struct { uint8_t *p; size_t n, cap; } ByteVec;
+
+static void cps_push(CpVec *v, uint16_t c) {
+    if (v->n == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 1024;
+        v->cp = realloc(v->cp, v->cap * sizeof(uint16_t));
+        if (!v->cp) { fprintf(stderr, "oom\n"); exit(1); }
+    }
+    v->cp[v->n++] = c;
+}
+
+static void bv_push(ByteVec *v, uint8_t b) {
+    if (v->n == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 4096;
+        v->p = realloc(v->p, v->cap);
+        if (!v->p) { fprintf(stderr, "oom\n"); exit(1); }
+    }
+    v->p[v->n++] = b;
+}
 
 static float fontSize = 0;
-static int dpi = 0;
-static int bpp = 1;
-static int enable_widths = 1;
+static int   dpi = 0, bpp = 1;
+static int   opt_dump = 0;
+static int   opt_preview = 0;
+static char *opt_text = NULL;
+static char *opt_font = NULL;
+static char *opt_chars = NULL;
+static int   opt_list_faces  = 0;
+static int   opt_face_index  = 0;
+static int   opt_weight      = -1;   /* -1 = not set */
+static int   opt_shadow      = 1;
 
-#define isNumber(n) ((n) >= '0' && (n) <= '9')
+typedef struct {
+    uint16_t w, h;
+    int16_t  x_off, y_off;
+    uint16_t adv;
+    ByteVec  bitmap;
+} Glyph;
 
-char     *charArg = "32-126";  // Default, use 32-126 range
-uint16_t chars[64*1024];
-uint16_t charCount;
-uint8_t  offsets[64*1024*2];
-uint16_t offsetCount;
+static int is_digit(int c) { return c >= '0' && c <= '9'; }
 
-// Same as uGUI's UG_FONT_DATA, but without const qualifiers, so we can use ram pointers. Only for ttf2ugui
-typedef struct
-{
-   FONT_TYPE  font_type;
-   UG_U8      is_old_font;
-   UG_U8      char_width;
-   UG_U8      char_height;
-   UG_U16     bytes_per_char;
-   UG_U16     number_of_chars;
-   UG_U16     number_of_offsets;
-   UG_U8      * widths;
-   UG_U8      * offsets;
-   UG_U8      * data;
-   UG_FONT    * font;   // Unused here
-} UG_FONT_DATA_RAM;
+static void parse_chars(CpVec *v, const char *s) {
+    /* Deduplication bitmap: one bit per codepoint (0x0000-0xFFFF) */
+    uint8_t *seen = calloc(0x10000 / 8, 1);
+    if (!seen) { fprintf(stderr, "oom\n"); exit(1); }
 
-/*
- * "draw" a pixel using ansi escape sequences.
- * Used for printing a ascii art sample of font.
- */
-static void drawPixel(UG_S16 x, UG_S16 y, UG_COLOR col)
-{
-  printf("\033[%d;%dH", y + 1, x + 1);
-
-  if (col == C_WHITE)
-    printf("\x1B[0m ");
-  else
-  {
-    if(col == C_BLACK)
-    {
-        printf("\x1B[0m■");
-    }
-    else
-    {
-        printf("\x1B[34m■");
-    }
-
-  }
-
-  fflush(stdout);
-}
-
-/*
- * Parse chars, create ranges and generate the complete char list to be generated
- * Based on code from: https://github.com/olikraus/u8g2/blob/master/tools/font/otf2bdf/otf2bdf.c
- */
-void parse_chars(char *s)
-{
-    uint16_t l, r;
-
-    /*
-     * Make sure to clear the flag and bitmap in case more than one subset is
-     * specified on the command line.
-     */
-    memset(chars, 0, sizeof(chars));  
-    charCount = 0;
-    uint16_t *charPtr=chars;
     while (*s) {
-        /*
-         * Collect the next code value.
-         */
-        for (l = r = 0; *s && isNumber(*s); s++){
-          l = (l * 10) + (*s - '0');
-    }
-
-        /*
-         * If the next character is an '_' or '-', advance and collect the end of the
-         * specified range.
-         */
-        if (*s == '_'|| *s == '-') {
-            s++;
-            for (; *s && isNumber(*s); s++){
-              r = (r * 10) + (*s - '0');
-      }
+        while (*s && !is_digit((unsigned char)*s)) s++;
+        if (!*s) break;
+        unsigned long l = 0;
+        while (is_digit((unsigned char)*s)) { l = l*10 + (*s - '0'); s++; }
+        unsigned long r = l;
+        if (*s == '-' || *s == '_') {
+            s++; r = 0;
+            while (is_digit((unsigned char)*s)) { r = r*10 + (*s - '0'); s++; }
         }
-    else{        
-      r = l;
-    }
-    
-    for(uint32_t t=l; t<=r; t++){
-      charCount++;
-      *charPtr++ = t;
-    }
-
-        /*
-         * Skip all non-digit characters.
-         */
-        while (*s && !isNumber(*s))
-          s++;
-    }
-  
-    /*
-    * Compute char ranges
-    */
-    for (uint16_t ch=0; ch<charCount; ){
-      offsets[offsetCount*2]=chars[ch]>>8;
-      offsets[(offsetCount*2)+1]=chars[ch]&0xFF;
-      offsetCount++;
-      ch++;  
-      if(chars[ch]==chars[ch-1]+1){
-        offsets[(offsetCount-1)*2] |= 0x80;
-        //printf("Offset Range Start: %u\n",offsets[offsetCount-1]&0x7FFF);    
-        while(ch<charCount-1 && chars[ch]+1==chars[ch+1]){      //Skip consecutive chars
-          ch++;
+        if (l > 0xFFFF || r > 0xFFFF || l > r) {
+            fprintf(stderr, "bad range %lu-%lu\n", l, r);
+            free(seen);
+            exit(1);
         }
-        offsets[offsetCount*2]=chars[ch]>>8;
-        offsets[(offsetCount*2)+1]=chars[ch]&0xFF;
-        offsetCount++;
-        ch++;  
-        //printf("Offset Range End: %u\n",offsets[offsetCount-1]&0x7FFF);
-      }
-      else{
-        //printf("Offset Single char: %u\n",offsets[offsetCount-1]);    
-      }
+        for (unsigned long c = l; c <= r; c++) {
+            if (seen[c >> 3] & (1 << (c & 7))) continue;
+            seen[c >> 3] |= (1 << (c & 7));
+            cps_push(v, (uint16_t)c);
+        }
     }
+    free(seen);
+
+    if (v->n == 0) { fprintf(stderr, "no chars\n"); exit(1); }
 }
 
-/*
- * Convert unicode to utf-8 array
- * Credits: https://gist.github.com/MightyPork/52eda3e5677b4b03524e40c9f0ab1da5
- */
-int utf8_encode(char *out, uint32_t utf)
+static void list_faces(const char *path)
 {
-  if (utf <= 0x7F) {
-    // Plain ASCII
-    out[0] = (char) utf;
-    out[1] = 0;
-    return 1;
-  }
-  else if (utf <= 0x07FF) {
-    // 2-byte unicode
-    out[0] = (char) (((utf >> 6) & 0x1F) | 0xC0);
-    out[1] = (char) (((utf >> 0) & 0x3F) | 0x80);
-    out[2] = 0;
-    return 2;
-  }
-  else if (utf <= 0xFFFF) {
-    // 3-byte unicode
-    out[0] = (char) (((utf >> 12) & 0x0F) | 0xE0);
-    out[1] = (char) (((utf >>  6) & 0x3F) | 0x80);
-    out[2] = (char) (((utf >>  0) & 0x3F) | 0x80);
-    out[3] = 0;
-    return 3;
-  }
-  else if (utf <= 0x10FFFF) {
-    // 4-byte unicode
-    out[0] = (char) (((utf >> 18) & 0x07) | 0xF0);
-    out[1] = (char) (((utf >> 12) & 0x3F) | 0x80);
-    out[2] = (char) (((utf >>  6) & 0x3F) | 0x80);
-    out[3] = (char) (((utf >>  0) & 0x3F) | 0x80);
-    out[4] = 0;
-    return 4;
-  }
-  else { 
-    // error - use replacement character
-    out[0] = (char) 0xEF;  
-    out[1] = (char) 0xBF;
-    out[2] = (char) 0xBD;
-    out[3] = 0;
-    return 0;
-  }
-}
+    FT_Library lib;
+    FT_Face    face;
+    FT_Error   err;
 
-static int max(int a, int b)
-{
-  if (a > b)
-    return a;
-
-  return b;
-}
-
-/*
- * Output C-language code that can be used to include
- * converted font into uGUI application.
- */
-static void dumpFont(UG_FONT_DATA_RAM * font, const char* fontFile, float fontSize,int bitsPerPixel)
-{
-  int bytesPerChar;
-  int ch;
-  int current;
-  int b;
-  char fontName[80];
-  char fileNameBuf[80];
-  const char* baseName;
-  char outFileName[80];
-  char* ptr;
-  FILE* out;
-  uint8_t newline=0;
-
-/*
- * Generate name for font by stripping path and suffix from filename, also remove spaces.
- */
-  baseName = fontFile;
-  ptr = strrchr(baseName, '/');
-  if (ptr)
-    baseName = ptr + 1;
-
-  strcpy(fileNameBuf, baseName);
-  
-  for(uint8_t t=0;;t++){
-    if(baseName[t]==0){
-    fileNameBuf[t] = 0; 
-    break;
+    if ((err = FT_Init_FreeType(&lib))) {
+        fprintf(stderr, "FT init %d\n", err);
+        exit(1);
     }
-    else if(baseName[t] == ' '){
-    fileNameBuf[t] = '_';
-    }
-    else{
-    fileNameBuf[t] = baseName[t];
-    }    
-  }
-  
-  baseName = fileNameBuf;
-  ptr = strchr(baseName, '.');
-  if (ptr)
-    *ptr = '\0';
 
-
-  sprintf(fontName, "%s_%dX%d", baseName, font->char_width, font->char_height);
-  sprintf(outFileName, "%s_%dX%d.c", baseName, font->char_width, font->char_height);
-
-
-  out = fopen(outFileName, "w");
-  if (!out) {
-
-    perror(outFileName);
-    exit(2);
-  }
-
-
-  /*
-   * First output character bitmaps.
-  */
-  switch(bitsPerPixel)
-  {
-    case 1:
+    /* Count faces in the file (TTC may contain several) */
+    FT_Long num_faces = 0;
     {
-        // Round up to full bytes
-        bytesPerChar = font->char_height * ((font->char_width +7)/ 8);
-    }break;
-
-    case 8:
-    {
-        bytesPerChar = font->char_height * font->char_width;
-    }break;
-  }
-  
-  /*
-  * Write font into
-  */
-  //fprintf(out, "  #include \"%s_%dX%d.h\"\n\n", baseName, font->char_width, font->char_height);
-  fprintf(out, "// Converted from %s\n", fontFile);
-  fprintf(out, "//  --size %.1f\n", fontSize);
-  if (dpi > 0)
-    fprintf(out, "//  --dpi %d\n", dpi);
-  fprintf(out, "//  --bpp %d\n\n", (int)bitsPerPixel);  
-  fprintf(out, "// For copyright, see original font file.\n\n");
-  fprintf(out, "/************************************************\n");
-  fprintf(out, "Add this lines to ugui.h:\n");
-  fprintf(out, "  #ifdef USE_FONT_%s\n",fontName);
-  fprintf(out, "  extern UG_FONT FONT_%s[];\n", fontName);
-  fprintf(out, "  #endif\n\n");
-  fprintf(out, "To enable this font, add this line to ugui_config.h:\n");
-  fprintf(out, "  #define UGUI_USE_FONT_%s\n", fontName);
-  fprintf(out, "************************************************/\n\n");
-
-  fprintf(out, "#include \"ugui.h\"\n");  
-  fprintf(out, "#ifdef UGUI_USE_FONT_%s\n\n",fontName);  
-  fprintf(out, "UG_FONT FONT_%s[] = {\n", fontName );
-  
-  // Print Header
-  fprintf(out, "  // BPP, Width, Height, Chars, Offsets, Bytes per char, Widths presence bit\n");
-  fprintf(out, "  0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,0x%02X,\n",
-          font->font_type,
-          font->char_width,
-          font->char_height,
-          (font->number_of_chars>>8)&0xFF,
-          font->number_of_chars&0xFF,
-          (font->number_of_offsets>>8)&0xFF,
-          font->number_of_offsets&0xFF,
-          (font->bytes_per_char>>8)&0xFF,          
-          font->bytes_per_char&0xFF,
-          enable_widths);
-      
-      
-  // Print char widths if enabled
-  if(enable_widths){
-    fprintf(out, "  // Widths\n  ");
-    newline=0;
-    for (ch = 0; ch < charCount;) {
-      fprintf(out, "0x%02X,", font->widths[ch++]);  
-      newline=0;
-      if(ch && ch%10==0){
-        fprintf(out, "\n  ");
-        newline=1;
-      }
+        FT_Face tmp;
+        err = FT_New_Face(lib, path, -1, &tmp);
+        if (err == 0) {
+            num_faces = tmp->num_faces;
+            FT_Done_Face(tmp);
+        }
     }
-    if(!newline)
-      fprintf(out, "\n  ");
-  }
-  else{
-    fprintf(out, "  ");
-  }
-  
-  // Print char offsets
-  fprintf(out, "// Offsets\n  ");
- 
-  newline=0;
-  for(uint16_t t=0;t<offsetCount*2;){
-    newline=0;  
-    fprintf(out, "0x%02X,", font->offsets[t++]);
-    if(t && t%10==0){
-      fprintf(out, "\n  ");
-      newline=1;
-    }
-  }
-  if(!newline)
-    fprintf(out, "\n  "); 
-      
-  fprintf(out, "// Bitmap data%*c  Hex     Dec   Char (UTF-8)\n",(bytesPerChar*5)-12, ' ');
-  current = 0;
-  
-  for (ch = 0; ch < charCount; ch++ ) {
-  if(!chars[ch]){
-    return;
-  }
-    fprintf(out, "  ");
-    for (b = 0; b < bytesPerChar; b++) {
-      fprintf(out, "0x%02X,", font->data[current]);
-      ++current;
-    }
-  
-  char utf8[5];
-  utf8_encode(utf8, chars[ch]);
-    fprintf(out, " // 0x%-4X  %-4u  '%s'\n", chars[ch], chars[ch], utf8);
-  }
+    if (num_faces <= 0) num_faces = 1;
 
-  fprintf(out, "};\n\n#endif\n");
+    for (FT_Long i = 0; i < num_faces; i++) {
+        err = FT_New_Face(lib, path, i, &face);
+        if (err) {
+            fprintf(stderr, "face %ld: <cannot load, err %d>\n", i, err);
+            continue;
+        }
 
-  fclose(out);
-}
+        /* usWeightClass from OS/2 table, if present */
+        int weight = -1;
+        if (face->style_flags & FT_STYLE_FLAG_BOLD) weight = 700;
 
-static UG_FONT_DATA_RAM newFont;
-
-static UG_FONT_DATA_RAM *convertFont(const char *font, int dpi, float fontSize,int bitsPerPixel)
-{
-  int     error;
-  FT_Face   face;
-  FT_Library   library;
-  int     bpp_mul;
-
-
-  switch(bitsPerPixel)
-  {
-    case 1: bpp_mul = 1; break;
-    case 8: bpp_mul = 16; break;
-    default:
-    {
-       fprintf(stderr, "Bits per pixel must be 1 or 8, not %d!!\n", bitsPerPixel);
-       exit(1);
-    }break;
-
-  }
-
-/*
- * Initialize freetype library, load the font
- * and set output character size.
- */
-  error = FT_Init_FreeType(&library);
-  if (error) {
-
-    fprintf(stderr, "ft init err %d\n", error);
-    exit(1);
-  }
-
-  error = FT_New_Face(library,
-                      font,
-                      0,
-                      &face);
-  if (error) {
-
-    fprintf(stderr, "ew faceerr %d\n", error);
-    exit(1);
-  }
-
-/*
- * If DPI is not given, use pixes to specify the size.
- */
-  if (dpi > 0)
-    error = FT_Set_Char_Size(face, 0, fontSize * 64 * bpp_mul, dpi, dpi);
-  else
-    error = FT_Set_Pixel_Sizes(face, 0, fontSize * bpp_mul);
-  if (error) {
-
-    fprintf(stderr, "set pixel sizes err %d\n", error);
-    exit(1);
-  }
-  
-  
-  parse_chars(charArg);
-  
-
-  int i, j,i_idx,j_idx;
-  int coverage;
-  uint32_t ch;
-  int maxWidth = 0;
-  int maxHeight = 0;
-  int maxAscent = 0;
-  int maxDescent = 0;
-  int bytesPerChar;
-  int bytesPerRow;
-
-/*
- * First found out how big character bitmap is needed. Every character
- * must fit into it so that we can obtain correct character positioning.
- */
-  for (ch = 0; ch <charCount; ch++) {
-
-    int ascent;
-    int descent;
-  if(!chars[ch]){
-    fprintf(stderr, "No chars defined %d\n", error);
-    exit(1);
-  }
-    error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
-    if (error) {
-
-      fprintf(stderr, "load char err %d\n", error);
-      exit(1);
-    }
-
-    descent = max(0, face->glyph->bitmap.rows - face->glyph->bitmap_top);
-    ascent = max(0, max(face->glyph->bitmap_top, face->glyph->bitmap.rows) - descent);
-
-    if (descent > maxDescent)
-      maxDescent = descent;
-
-    if (ascent > maxAscent)
-      maxAscent = ascent;
-
-    if (face->glyph->bitmap.width > maxWidth)
-      maxWidth = face->glyph->bitmap.width;
-  }
-
-  maxWidth = maxWidth / bpp_mul;
-  maxHeight = (maxAscent + maxDescent) / bpp_mul;
-
-  switch(bitsPerPixel)
-  {
-    case 1:
-    {
-        // Round up to full bytes
-        bytesPerRow = (maxWidth +7 )/ 8;
-    }break;
-
-    case 8:
-    {
-        bytesPerRow = maxWidth;
-    }break;
-  }
-
-
-  bytesPerChar = bytesPerRow * maxHeight;
-  newFont.data = calloc(1, bytesPerChar * charCount);
-  newFont.number_of_offsets = offsetCount;
-  newFont.offsets = offsets;
-  
-  switch(bitsPerPixel)
-  {
-        case 1: newFont.font_type = FONT_TYPE_1BPP; break;
-        case 8: newFont.font_type = FONT_TYPE_8BPP; break;
-  }
-
-  newFont.char_width  = maxWidth;
-  newFont.char_height = maxHeight;
-  newFont.bytes_per_char = bytesPerChar;
-  newFont.number_of_chars = charCount;
-  newFont.widths      = malloc(charCount);
-
-/*
- * Render each character.
- */
-  for (ch = 0; ch <charCount; ch++) {
-
-    error = FT_Load_Char(face, chars[ch], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
-    if (error) {
-
-      fprintf(stderr, "load char err %d\n", error);
-      exit(1);
-    }
-
-    for (i = 0; i < face->glyph->bitmap.rows / bpp_mul; i++)
-      for (j = 0; j < face->glyph->bitmap.width / bpp_mul; j++) {
-
-        coverage = 0;
-
-        for(i_idx =0; i_idx < bpp_mul;i_idx++) {
-            for(j_idx = 0; j_idx < bpp_mul;j_idx++) {
-
-
-                uint8_t *bits = (uint8_t *) face->glyph->bitmap.buffer;
-                uint8_t b = bits[(i*bpp_mul+i_idx) * face->glyph->bitmap.pitch + ((j*bpp_mul+j_idx) / 8)];
-
-
-                if (b & (1 << (7 - ((j*bpp_mul+j_idx) % 8))))
-                {
-                    coverage ++;
+        /* Variable font weight axis default */
+        FT_MM_Var *mm = NULL;
+        if (FT_Get_MM_Var(face, &mm) == 0) {
+            for (FT_UInt a = 0; a < mm->num_axis; a++) {
+                if (mm->axis[a].tag == FT_MAKE_TAG('w','g','h','t')) {
+                    weight = (int)(mm->axis[a].def / 65536);
+                    break;
                 }
+            }
+            FT_Done_MM_Var(lib, mm);
+        }
 
+        printf("face %ld: %s, style \"%s\"",
+               i,
+               face->family_name ? face->family_name : "?",
+               face->style_name  ? face->style_name  : "?");
+        if (weight > 0) printf(", weight %d", weight);
+        printf("\n");
+
+        FT_Done_Face(face);
+    }
+
+    FT_Done_FreeType(lib);
+}
+
+static void convert_font(const char *path, CpVec *cps, Glyph **out,
+                         uint16_t *omw, uint16_t *omh, uint16_t *onotdef_adv)
+{
+    FT_Library lib; FT_Face face; FT_Error err;
+    if ((err = FT_Init_FreeType(&lib))) { fprintf(stderr, "FT init %d\n", err); exit(1); }
+    if ((err = FT_New_Face(lib, path, opt_face_index, &face))) {
+        fprintf(stderr, "FT face %d\n", err); exit(1);
+    }
+
+    /* Variable font weight (only if --weight given and font has "wght" axis) */
+    if (opt_weight >= 0) {
+        FT_MM_Var *mm = NULL;
+        if (FT_Get_MM_Var(face, &mm) == 0) {
+            FT_UInt wght_idx = 0;
+            int found = 0;
+            for (FT_UInt a = 0; a < mm->num_axis; a++) {
+                if (mm->axis[a].tag == FT_MAKE_TAG('w','g','h','t')) {
+                    wght_idx = a;
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) {
+                FT_Fixed coords[16] = {0};
+                FT_UInt n = mm->num_axis;
+                if (n > 16) n = 16;
+                for (FT_UInt a = 0; a < n; a++) coords[a] = mm->axis[a].def;
+                coords[wght_idx] = (FT_Fixed)opt_weight * 65536;
+                FT_Set_Var_Design_Coordinates(face, n, coords);
+            } else {
+                fprintf(stderr, "note: font has no 'wght' axis, --weight ignored\n");
+            }
+            FT_Done_MM_Var(lib, mm);
+        } else {
+            fprintf(stderr, "note: font is not variable, --weight ignored\n");
+        }
+    }
+    if (dpi > 0) err = FT_Set_Char_Size(face, 0, (FT_F26Dot6)(fontSize * 64.0f), dpi, dpi);
+    else         err = FT_Set_Pixel_Sizes(face, 0, (FT_UInt)fontSize);
+    if (err) { fprintf(stderr, "FT size %d\n", err); exit(1); }
+
+    /* Load .notdef to get its advance, used as placeholder for missing glyphs */
+    uint16_t notdef_adv = 0;
+    {
+        FT_UInt nd_idx = 0;
+        if (FT_Load_Glyph(face, nd_idx, FT_LOAD_RENDER | FT_LOAD_TARGET_MONO) == 0) {
+            notdef_adv = (uint16_t)(face->glyph->advance.x >> 6);
+        }
+    }
+
+    Glyph *gs = calloc(cps->n, sizeof(Glyph));
+    if (!gs) { fprintf(stderr, "oom\n"); exit(1); }
+
+    CpVec    cps_valid = {0};
+    uint32_t nvalid    = 0;
+    uint16_t maxw = 0, maxh = 0;
+
+    for (uint32_t i = 0; i < cps->n; i++) {
+        FT_UInt cp = cps->cp[i];
+
+        /* Missing-glyph detection: FT_Get_Char_Index returns 0 when the
+         * codepoint is not present in this font (glyph index 0 is always
+         * reserved for .notdef). Report and skip. */
+        FT_UInt glyph_index = FT_Get_Char_Index(face, cp);
+        if (glyph_index == 0) {
+            fprintf(stderr, "[missing] U+%04X not present in font, skipped\n", cp);
+            continue;
+        }
+
+        FT_Int32 fl = (bpp == 8) ? (FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL | FT_LOAD_NO_BITMAP)
+                                 : (FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
+        if ((err = FT_Load_Char(face, cp, fl))) {
+            fprintf(stderr, "[error] U+%04X FT_Load_Char failed %d, skipped\n", cp, err);
+            continue;
+        }
+
+        FT_Bitmap *bm = &face->glyph->bitmap;
+        Glyph *g = &gs[nvalid];
+
+        if (bm->width  > MAX_GLYPH_W || bm->rows > MAX_GLYPH_H ||
+            face->glyph->bitmap_left < -MAX_BEARING ||
+            face->glyph->bitmap_left >  MAX_BEARING ||
+            face->glyph->bitmap_top  < -MAX_BEARING ||
+            face->glyph->bitmap_top  >  MAX_BEARING ||
+            (face->glyph->advance.x >> 6) < 0 ||
+            (face->glyph->advance.x >> 6) > 65535) {
+            fprintf(stderr, "[error] U+%04X metric out of range, skipped\n", cp);
+            continue;
+        }
+
+        g->w     = (uint16_t)bm->width;
+        g->h     = (uint16_t)bm->rows;
+        g->x_off = (int16_t)face->glyph->bitmap_left;
+        g->y_off = (int16_t)face->glyph->bitmap_top;
+        g->adv   = (uint16_t)(face->glyph->advance.x >> 6);
+
+        if (g->w > maxw) maxw = g->w;
+        if (g->h > maxh) maxh = g->h;
+
+        if (bpp == 1) {
+            uint16_t bpr = (g->w + 7) / 8;
+            for (uint16_t y = 0; y < g->h; y++) {
+                for (uint16_t bx = 0; bx < bpr; bx++) {
+                    uint8_t outb = 0;
+                    for (uint8_t k = 0; k < 8; k++) {
+                        uint16_t x = bx * 8 + k;
+                        if (x >= g->w) break;
+                        uint8_t byte = bm->buffer[y * bm->pitch + (x >> 3)];
+                        if (byte & (0x80 >> (x & 7))) outb |= (1u << k);
+                    }
+                    bv_push(&g->bitmap, outb);
+                }
+            }
+        } else {
+            for (uint16_t y = 0; y < g->h; y++)
+                for (uint16_t x = 0; x < g->w; x++)
+                    bv_push(&g->bitmap, bm->buffer[y * bm->pitch + x]);
+        }
+
+        cps_push(&cps_valid, cp);
+        nvalid++;
+    }
+
+    free(cps->cp);
+    *cps = cps_valid;
+
+    FT_Done_Face(face); FT_Done_FreeType(lib);
+
+    *out         = gs;
+    *omw         = maxw;
+    *omh         = maxh;
+    *onotdef_adv = notdef_adv;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sort codepoints + glyphs together, ascending by codepoint           */
+/* ------------------------------------------------------------------ */
+
+typedef struct { uint16_t cp; Glyph g; } CpGlyphPair;
+
+static int cmp_cp_glyph_pair(const void *a, const void *b)
+{
+    uint16_t ca = ((const CpGlyphPair*)a)->cp;
+    uint16_t cb = ((const CpGlyphPair*)b)->cp;
+    return (ca > cb) - (ca < cb);
+}
+
+static void sort_cps_glyphs(CpVec *cps, Glyph *gs)
+{
+    uint32_t n = cps->n;
+    if (n < 2) return;
+
+    if (n > 64) {
+        CpGlyphPair *pairs = malloc(n * sizeof(CpGlyphPair));
+        if (!pairs) { fprintf(stderr, "oom\n"); exit(1); }
+        for (uint32_t i = 0; i < n; i++) {
+            pairs[i].cp = cps->cp[i];
+            pairs[i].g  = gs[i];
+        }
+        qsort(pairs, n, sizeof(CpGlyphPair), cmp_cp_glyph_pair);
+        for (uint32_t i = 0; i < n; i++) {
+            cps->cp[i] = pairs[i].cp;
+            gs[i]      = pairs[i].g;
+        }
+        free(pairs);
+    } else {
+        for (uint32_t i = 1; i < n; i++) {
+            uint16_t cp = cps->cp[i];
+            Glyph    g  = gs[i];
+            uint32_t j = i;
+            while (j > 0 && cps->cp[j-1] > cp) {
+                cps->cp[j] = cps->cp[j-1];
+                gs[j]      = gs[j-1];
+                j--;
+            }
+            cps->cp[j] = cp;
+            gs[j]      = g;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Font name sanitizer (returns malloc'd string)                       */
+/* ------------------------------------------------------------------ */
+
+static char *sanitize_alloc(const char *path)
+{
+    const char *b = strrchr(path, '/');
+#ifdef _WIN32
+    const char *b2 = strrchr(path, '\\');
+    if (!b || (b2 && b2 > b)) b = b2;
+#endif
+    b = b ? b + 1 : path;
+
+    size_t len = 0;
+    while (b[len] && b[len] != '.') len++;
+
+    char *out = malloc(len + 1);
+    if (!out) { fprintf(stderr, "oom\n"); exit(1); }
+
+    for (size_t i = 0; i < len; i++) {
+        char c = b[i];
+        if (!((c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') ||
+              c == '_')) {
+            c = '_';
+        }
+        out[i] = c;
+    }
+    out[len] = 0;
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Dump font as C array                                               */
+/* ------------------------------------------------------------------ */
+
+static void dump_font(const char *path, CpVec *cps, Glyph *gs,
+                      uint16_t maxw, uint16_t maxh, uint16_t notdef_adv)
+{
+    char *base = sanitize_alloc(path);
+
+    size_t base_len  = strlen(base);
+    size_t fname_len = base_len + 12 + 1;
+    size_t oname_len = base_len + 14 + 1;
+
+    char *fname = malloc(fname_len);
+    char *oname = malloc(oname_len);
+    if (!fname || !oname) { fprintf(stderr, "oom\n"); exit(1); }
+
+    snprintf(fname, fname_len, "%s_%uX%u", base, (unsigned)maxw, (unsigned)maxh);
+    snprintf(oname, oname_len, "%s.c", fname);
+
+    FILE *o = fopen(oname, "w");
+    if (!o) { fprintf(stderr, "open %s: %s\n", oname, strerror(errno)); exit(1); }
+
+    uint32_t n = cps->n;
+
+    uint32_t total = UG_FONT_HEADER_SIZE
+                   + n * UG_FONT_CODEPOINT_SIZE
+                   + n * UG_FONT_METRICS_SIZE
+                   + n * UG_FONT_DATA_OFFSET_SIZE;
+    for (uint32_t i = 0; i < n; i++) total += (uint32_t)gs[i].bitmap.n;
+
+    /* ---------------- file header comment ---------------- */
+    fprintf(o, "// Converted from %s\n", path);
+    fprintf(o, "//  --size %.1f\n", fontSize);
+    if (dpi > 0) fprintf(o, "//  --dpi %d\n", dpi);
+    fprintf(o, "//  --bpp %d\n", bpp);
+    fprintf(o, "//\n");
+    fprintf(o, "// Font array layout:\n");
+    fprintf(o, "//   [header: 20 bytes]\n");
+    fprintf(o, "//     [0]      font format: bit7=0 new, bit0=font type (0=1BPP, 1=8BPP)\n");
+    fprintf(o, "//     [1]      reserved, must be 0\n");
+    fprintf(o, "//     [2-3]    max_ink_w       2-byte big-endian\n");
+    fprintf(o, "//     [4-5]    max_ink_h       2-byte big-endian\n");
+    fprintf(o, "//     [6-9]    number_of_chars 4-byte big-endian\n");
+    fprintf(o, "//     [10-13]  total_size      4-byte big-endian\n");
+    fprintf(o, "//     [14-15]  notdef_adv      2-byte big-endian\n");
+    fprintf(o, "//     [16-19]  reserved, must be 0\n");
+    fprintf(o, "//   [codepoints:   n * 2 bytes, 2-byte big-endian, ascending]\n");
+    fprintf(o, "//   [metrics:      n * 10 bytes, each field 2-byte big-endian]\n");
+    fprintf(o, "//                  w(2) h(2) x_off(2 signed) y_off(2 signed) adv(2)\n");
+    fprintf(o, "//   [data_offsets: n * 4 bytes, 4-byte big-endian]\n");
+    fprintf(o, "//   [data:         1BPP: ceil(w/8)*h bytes per glyph, LSB-left, row-major]\n");
+    fprintf(o, "//                  8BPP: w*h bytes per glyph, row-major]\n");
+    fprintf(o, "//\n\n");
+
+    fprintf(o, "#include \"ugui.h\"\n");
+    fprintf(o, "#ifdef UGUI_USE_FONT_%s\n\n", fname);
+    fprintf(o, "UG_FONT FONT_%s[] = {\n", fname);
+
+    /* ---------------- header (20 bytes) ---------------- */
+    fprintf(o, "  /* ============================================================ */\n");
+    fprintf(o, "  /* Font header: 20 bytes                                         */\n");
+    fprintf(o, "  /* ============================================================ */\n");
+
+    fprintf(o, "  /* [0]      font format: bit7=0 new, bit0=font type (0=1BPP, 1=8BPP) */\n");
+    fprintf(o, "  /* [1]      reserved, must be 0                                  */\n");
+    fprintf(o, "  0x%02X,0x00,\n", (bpp == 8) ? UG_FONT_TYPE_8BPP : UG_FONT_TYPE_1BPP);
+
+    fprintf(o, "  /* [2-3]    max_ink_w: 2-byte big-endian                         */\n");
+    fprintf(o, "  0x%02X,0x%02X,\n", (maxw >> 8) & 0xFF, maxw & 0xFF);
+
+    fprintf(o, "  /* [4-5]    max_ink_h: 2-byte big-endian                         */\n");
+    fprintf(o, "  0x%02X,0x%02X,\n", (maxh >> 8) & 0xFF, maxh & 0xFF);
+
+    fprintf(o, "  /* [6-9]    number_of_chars: 4-byte big-endian                   */\n");
+    fprintf(o, "  0x%02X,0x%02X,0x%02X,0x%02X,\n",
+            (n >> 24) & 0xFF, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF);
+
+    fprintf(o, "  /* [10-13]  total_size: 4-byte big-endian                        */\n");
+    fprintf(o, "  0x%02X,0x%02X,0x%02X,0x%02X,\n",
+            (total >> 24) & 0xFF, (total >> 16) & 0xFF, (total >> 8) & 0xFF, total & 0xFF);
+
+    fprintf(o, "  /* [14-15]  notdef_adv: 2-byte big-endian                        */\n");
+    fprintf(o, "  0x%02X,0x%02X,\n", (notdef_adv >> 8) & 0xFF, notdef_adv & 0xFF);
+
+    fprintf(o, "  /* [16-19]  reserved, must be 0                                  */\n");
+    fprintf(o, "  0x00,0x00,0x00,0x00,\n");
+
+    /* ---------------- codepoints ---------------- */
+    fprintf(o, "\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    fprintf(o, "  /* Codepoints: number_of_chars * 2 bytes, big-endian, ascending */\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    for (uint32_t i = 0; i < n; i++) {
+        fprintf(o, "  0x%02X,0x%02X,   /* U+%04X */\n",
+                (cps->cp[i] >> 8) & 0xFF, cps->cp[i] & 0xFF, cps->cp[i]);
+    }
+
+    /* ---------------- metrics ---------------- */
+    fprintf(o, "\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    fprintf(o, "  /* Metrics: number_of_chars * 10 bytes                          */\n");
+    fprintf(o, "  /*   [0-1] w     2-byte big-endian, ink width                   */\n");
+    fprintf(o, "  /*   [2-3] h     2-byte big-endian, ink height                  */\n");
+    fprintf(o, "  /*   [4-5] x_off 2-byte big-endian, signed, left bearing        */\n");
+    fprintf(o, "  /*   [6-7] y_off 2-byte big-endian, signed, top bearing         */\n");
+    fprintf(o, "  /*   [8-9] adv   2-byte big-endian, advance                     */\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    for (uint32_t i = 0; i < n; i++) {
+        Glyph *g = &gs[i];
+        fprintf(o, "  0x%02X,0x%02X, 0x%02X,0x%02X, 0x%02X,0x%02X, 0x%02X,0x%02X, 0x%02X,0x%02X,   /* U+%04X */\n",
+                (g->w >> 8) & 0xFF, g->w & 0xFF,
+                (g->h >> 8) & 0xFF, g->h & 0xFF,
+                ((uint16_t)g->x_off >> 8) & 0xFF, (uint16_t)g->x_off & 0xFF,
+                ((uint16_t)g->y_off >> 8) & 0xFF, (uint16_t)g->y_off & 0xFF,
+                (g->adv >> 8) & 0xFF, g->adv & 0xFF,
+                cps->cp[i]);
+    }
+
+    /* ---------------- data_offsets ---------------- */
+    fprintf(o, "\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    fprintf(o, "  /* Data offsets: number_of_chars * 4 bytes, big-endian          */\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        fprintf(o, "  0x%02X,0x%02X,0x%02X,0x%02X,   /* U+%04X */\n",
+                (off >> 24) & 0xFF, (off >> 16) & 0xFF, (off >> 8) & 0xFF, off & 0xFF,
+                cps->cp[i]);
+        off += (uint32_t)gs[i].bitmap.n;
+    }
+
+    /* ---------------- data ---------------- */
+    fprintf(o, "\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    fprintf(o, "  /* Data: glyph bitmaps                                          */\n");
+    fprintf(o, "  /*   1BPP: ceil(w/8) * h bytes per glyph, LSB-left, row-major   */\n");
+    fprintf(o, "  /*   8BPP: w * h bytes per glyph, row-major                     */\n");
+    fprintf(o, "  /* ============================================================ */\n");
+    for (uint32_t i = 0; i < n; i++) {
+        Glyph *g = &gs[i];
+
+        if (g->bitmap.n == 0) {
+            fprintf(o, "  /* U+%04X: w=0 h=0, no data */\n", cps->cp[i]);
+            continue;
+        }
+
+        fprintf(o, "  ");
+        for (size_t k = 0; k < g->bitmap.n; k++) {
+            fprintf(o, "0x%02X,", g->bitmap.p[k]);
+        }
+        fprintf(o, "   /* U+%04X */\n", cps->cp[i]);
+    }
+
+    fprintf(o, "};\n\n#endif\n");
+    fclose(o);
+    fprintf(stderr, "wrote %s (%u glyphs, max %ux%u, total %u bytes)\n",
+            oname, n, maxw, maxh, total);
+
+    free(base);
+    free(fname);
+    free(oname);
+}
+
+/* ------------------------------------------------------------------ */
+/* BMP preview                                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int      w, h;
+    uint8_t *idx;
+    int      row_bytes;
+} BmpCanvas;
+
+static uint16_t ugui_mix_rgb565(uint16_t fc, uint16_t bc, uint8_t b)
+{
+    uint32_t fb = b;
+    uint32_t bb = 256 - b;
+    uint16_t r = (uint16_t)((((fc >> 11) & 0x1F) * fb + ((bc >> 11) & 0x1F) * bb) >> 8);
+    uint16_t g = (uint16_t)((((fc >>  5) & 0x3F) * fb + ((bc >>  5) & 0x3F) * bb) >> 8);
+    uint16_t bl= (uint16_t)((( fc        & 0x1F) * fb + ( bc        & 0x1F) * bb) >> 8);
+    return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+static void rgb565_to_rgb888(uint16_t c, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    uint8_t r5 = (c >> 11) & 0x1F;
+    uint8_t g6 = (c >>  5) & 0x3F;
+    uint8_t b5 =  c        & 0x1F;
+    *r = (uint8_t)((r5 << 3) | (r5 >> 2));
+    *g = (uint8_t)((g6 << 2) | (g6 >> 4));
+    *b = (uint8_t)((b5 << 3) | (b5 >> 2));
+}
+
+static int bmp_write_8(const char *path, const BmpCanvas *c,
+                       uint16_t fc, uint16_t bc)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "open %s: %s\n", path, strerror(errno)); return -1; }
+
+    int row_bytes = ((c->w + 3) / 4) * 4;
+    int data_size = row_bytes * c->h;
+    int file_size = 14 + 40 + 256 * 4 + data_size;
+
+    uint8_t hdr[54] = {0};
+
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = (uint8_t)(file_size);
+    hdr[3] = (uint8_t)(file_size >> 8);
+    hdr[4] = (uint8_t)(file_size >> 16);
+    hdr[5] = (uint8_t)(file_size >> 24);
+    int data_offset = 54 + 256 * 4;
+    hdr[10] = (uint8_t)(data_offset);
+    hdr[11] = (uint8_t)(data_offset >> 8);
+    hdr[12] = (uint8_t)(data_offset >> 16);
+    hdr[13] = (uint8_t)(data_offset >> 24);
+
+    hdr[14] = 40;
+    hdr[18] = (uint8_t)(c->w);
+    hdr[19] = (uint8_t)(c->w >> 8);
+    hdr[20] = (uint8_t)(c->w >> 16);
+    hdr[21] = (uint8_t)(c->w >> 24);
+    hdr[22] = (uint8_t)(c->h);
+    hdr[23] = (uint8_t)(c->h >> 8);
+    hdr[24] = (uint8_t)(c->h >> 16);
+    hdr[25] = (uint8_t)(c->h >> 24);
+    hdr[26] = 1;
+    hdr[28] = 8;
+
+    fwrite(hdr, 1, 54, f);
+
+    for (int i = 0; i < 256; i++) {
+        uint16_t mixed = ugui_mix_rgb565(fc, bc, (uint8_t)i);
+        uint8_t r, g, b;
+        rgb565_to_rgb888(mixed, &r, &g, &b);
+        uint8_t e[4] = { b, g, r, 0 };
+        fwrite(e, 1, 4, f);
+    }
+
+    uint8_t *row = calloc(1, row_bytes);
+    if (!row) { fclose(f); return -1; }
+    for (int y = c->h - 1; y >= 0; y--) {
+        memcpy(row, c->idx + (size_t)y * c->row_bytes, c->w);
+        fwrite(row, 1, row_bytes, f);
+    }
+    free(row);
+    fclose(f);
+    return 0;
+}
+
+static void render_preview(CpVec *cps, Glyph *gs, uint16_t maxh,
+                           const char *text, const char *out_path)
+{
+    int line_h = maxh + 1;
+
+    /* ---------------------------------------------------------------- */
+    /* Pass 1: measure the tight bounding box of the rendered text       */
+    /* ---------------------------------------------------------------- */
+    int xp = 0, yp = 0;
+    int min_x = INT32_MAX, min_y = INT32_MAX;
+    int max_x = INT32_MIN, max_y = INT32_MIN;
+    int any = 0;
+
+    const char *s = text;
+    while (*s) {
+        uint32_t cp = 0;
+        unsigned char c0 = (unsigned char)*s;
+        int n;
+        if (c0 < 0x80) { cp = c0; n = 1; }
+        else if ((c0 & 0xE0) == 0xC0) { cp = c0 & 0x1F; n = 2; }
+        else if ((c0 & 0xF0) == 0xE0) { cp = c0 & 0x0F; n = 3; }
+        else if ((c0 & 0xF8) == 0xF0) { cp = c0 & 0x07; n = 4; }
+        else { s++; continue; }
+
+        for (int k = 1; k < n; k++) {
+            if ((s[k] & 0xC0) != 0x80) { cp = 0; break; }
+            cp = (cp << 6) | (s[k] & 0x3F);
+        }
+        s += n;
+        if (cp == 0) continue;
+
+        if (cp == '\n') { xp = 0; yp += line_h; continue; }
+
+        uint32_t lo = 0, hi = cps->n, gi = 0;
+        int found = 0;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (cps->cp[mid] == cp) { gi = mid; found = 1; break; }
+            if (cps->cp[mid] < cp) lo = mid + 1; else hi = mid;
+        }
+        if (!found) continue;
+
+        Glyph *g = &gs[gi];
+        if (g->w == 0 || g->h == 0) { xp += g->adv + 1; continue; }
+
+        int draw_x = xp + g->x_off;
+        int draw_y = yp - g->y_off;
+
+        if (draw_x        < min_x) min_x = draw_x;
+        if (draw_y        < min_y) min_y = draw_y;
+        if (draw_x + g->w > max_x) max_x = draw_x + g->w;
+        if (draw_y + g->h > max_y) max_y = draw_y + g->h;
+        /* 1BPP 影子偏移 (+1, +1)，画布扩 1 像素 */
+        if (bpp == 1 && opt_shadow) {
+            if (draw_x + g->w + 1 > max_x) max_x = draw_x + g->w + 1;
+            if (draw_y + g->h + 1 > max_y) max_y = draw_y + g->h + 1;
+        }
+        any = 1;
+
+        xp += g->adv + 1;
+    }
+
+    if (!any) {
+        min_x = min_y = 0;
+        max_x = max_y = 1;
+    }
+
+    int pad_top = 2;
+    int pad_bottom = 2;
+    int w = max_x - min_x;
+    int h = (max_y - min_y) + pad_top + pad_bottom;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > PREVIEW_W) w = PREVIEW_W;
+    if (h > PREVIEW_H) h = PREVIEW_H;
+
+    /* ---------------------------------------------------------------- */
+    /* Pass 2: render into an w*h indexed canvas                         */
+    /* ---------------------------------------------------------------- */
+    BmpCanvas cv;
+    cv.w = w;
+    cv.h = h;
+    cv.row_bytes = ((w + 3) / 4) * 4;
+    cv.idx = calloc((size_t)cv.row_bytes * h, 1);
+    if (!cv.idx) { fprintf(stderr, "oom\n"); exit(1); }
+
+    uint16_t fc = C_BLACK;
+    uint16_t bc = C_WHITE;
+
+    memset(cv.idx, 0, (size_t)cv.row_bytes * h);
+
+    xp = 0; yp = 0;
+    s = text;
+    while (*s) {
+        uint32_t cp = 0;
+        unsigned char c0 = (unsigned char)*s;
+        int n;
+        if (c0 < 0x80) { cp = c0; n = 1; }
+        else if ((c0 & 0xE0) == 0xC0) { cp = c0 & 0x1F; n = 2; }
+        else if ((c0 & 0xF0) == 0xE0) { cp = c0 & 0x0F; n = 3; }
+        else if ((c0 & 0xF8) == 0xF0) { cp = c0 & 0x07; n = 4; }
+        else { s++; continue; }
+
+        for (int k = 1; k < n; k++) {
+            if ((s[k] & 0xC0) != 0x80) { cp = 0; break; }
+            cp = (cp << 6) | (s[k] & 0x3F);
+        }
+        s += n;
+        if (cp == 0) continue;
+
+        if (cp == '\n') { xp = 0; yp += line_h; continue; }
+
+        uint32_t lo = 0, hi = cps->n, gi = 0;
+        int found = 0;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (cps->cp[mid] == cp) { gi = mid; found = 1; break; }
+            if (cps->cp[mid] < cp) lo = mid + 1; else hi = mid;
+        }
+        if (!found) continue;
+
+        Glyph *g = &gs[gi];
+        if (g->w == 0 || g->h == 0) { xp += g->adv + 1; continue; }
+
+        int draw_x = xp + g->x_off;
+        int draw_y = yp - g->y_off;
+
+        int bx = draw_x - min_x;
+        int by = draw_y - min_y + pad_top;
+
+        if (bpp == 1) {
+            /* --- 1BPP: shadow pass (offset +1, +1, value 128) --- */
+            uint16_t bpr = (g->w + 7) / 8;
+            if (opt_shadow) {
+                /* --- 1BPP: shadow pass (offset +1, +1, value 128) --- */
+                for (int j = 0; j < g->h; j++) {
+                    for (int i = 0; i < g->w; i++) {
+                        uint8_t byte = g->bitmap.p[j * bpr + (i >> 3)];
+                        if (!((byte >> (i & 7)) & 1)) continue;
+                        int sx = bx + i + 1;
+                        int sy = by + j + 1;
+                        if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+                            cv.idx[(size_t)sy * cv.row_bytes + sx] = 128;
+                        }
+                    }
+                }
+            }
+            /* --- 1BPP: main pass (value 255) --- */
+            for (int j = 0; j < g->h; j++) {
+                for (int i = 0; i < g->w; i++) {
+                    uint8_t byte = g->bitmap.p[j * bpr + (i >> 3)];
+                    if (!((byte >> (i & 7)) & 1)) continue;
+                    int sx = bx + i;
+                    int sy = by + j;
+                    if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+                        cv.idx[(size_t)sy * cv.row_bytes + sx] = 255;
+                    }
+                }
+            }
+        } else {
+            /* --- 8BPP: 原来的画法 --- */
+            for (int j = 0; j < g->h; j++) {
+                for (int i = 0; i < g->w; i++) {
+                    int sx = bx + i;
+                    int sy = by + j;
+                    if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+                    cv.idx[(size_t)sy * cv.row_bytes + sx] = g->bitmap.p[j * g->w + i];
+                }
             }
         }
 
+        xp += g->adv + 1;
+    }
 
-        /*
-         * Output character to correct position in bitmap
-         */
+    if (bmp_write_8(out_path, &cv, fc, bc) == 0)
+        fprintf(stderr, "wrote %s (%dx%d, 8bpp indexed)\n", out_path, cv.w, cv.h);
 
-        int xpos, ypos,ind;
-
-        xpos = j + (face->glyph->bitmap_left / bpp_mul);
-        ypos = (maxAscent/bpp_mul) + i - (face->glyph->bitmap_top / bpp_mul);
-
-
-        switch(bitsPerPixel)
-        {
-
-            case 1:
-            {
-
-                ind = ypos * bytesPerRow;
-                ind += xpos / 8;
-
-
-                if (coverage !=0)
-                    newFont.data[(ch * bytesPerChar) + ind] |= (1 << ((xpos % 8)));
-            }break;
-
-            case 8:
-            {
-                ind = ypos * bytesPerRow;
-                ind += xpos ;
-
-                newFont.data[(ch * bytesPerChar) + ind  ] = (255 * coverage)/256; // need to be 0..255 range
-
-            }break;
-        }
-      }
-
-    /*
-     * Save character width, freetype uses 1/64 as units for it.
-     */
-    newFont.widths[ch] = (face->glyph->advance.x >> 6) / bpp_mul;
-
-  }
-
-  return &newFont;
+    free(cv.idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* CLI                                                                */
+/* ------------------------------------------------------------------ */
+
+static void usage(void)
+{
+    fprintf(stderr,
+        "\nttf2ugui {--dump | --preview} [options]\n"
+        "  --font=FILE     TTF/OTF font file\n"
+        "  --size=N        size (px, or pt if --dpi)\n"
+        "  --dpi=N         optional\n"
+        "  --bpp=N         1 (default) or 8\n"
+        "  --chars=LIST    default 32-126, use --chars=...\n"
+        "  --dump          write C font file\n"
+        "  --preview       write preview.bmp (512x512, 8bpp indexed)\n"
+        "  --text=TEXT     text to render into preview.bmp\n"
+        "  --list-faces    list all faces in the font file and exit\n"
+        "  --face-index=N  select face index N (default 0, for TTC)\n"
+        "  --weight=N      variable font weight (100-900), only for VF\n"
+        "  --shadow=N      1 = draw shadow (default), 0 = no shadow, 1BPP only\n");
+}
+
+#ifdef _WIN32
 /*
- * Draw a simple sample of new font with uGUI.
+ * Windows gives us argv in the system ANSI code page (GBK on Chinese
+ * Windows). Convert it to UTF-8 so the rest of the code can treat text
+ * as UTF-8 uniformly.
  */
-static void showFont( UG_FONT_DATA_RAM * font, char* text)
+static char *ansi_to_utf8(const char *ansi)
 {
-  UG_Init(&gui, &device);
-  UG_FillScreen(C_WHITE);
-  UG_DrawFrame(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1, C_BLACK);
-  memcpy(&gui.currentFont, &newFont, sizeof(UG_FONT_DATA_RAM));
-  UG_SetBackcolor(C_WHITE);
-  UG_SetForecolor(C_BLACK);
-  UG_PutString(2, 2, text);
-  UG_DrawPixel(0, SCREEN_HEIGHT - 1, C_WHITE);
-  UG_Update();
+    int wlen = MultiByteToWideChar(CP_ACP, 0, ansi, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+
+    wchar_t *wbuf = malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wbuf) return NULL;
+    MultiByteToWideChar(CP_ACP, 0, ansi, -1, wbuf, wlen);
+
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, NULL, 0, NULL, NULL);
+    if (ulen <= 0) { free(wbuf); return NULL; }
+
+    char *ubuf = malloc((size_t)ulen);
+    if (!ubuf) { free(wbuf); return NULL; }
+    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, ubuf, ulen, NULL, NULL);
+
+    free(wbuf);
+    return ubuf;
 }
-
-static int dump;
-static char* fontFile = NULL;
-static char* showText = NULL;
-
- /* options descriptor */
-static struct option longopts[] = {
-  {"show", required_argument, NULL, 'a'},
-  {"dump", no_argument, &dump, 1},
-  {"dpi", required_argument, NULL, 'd'},
-  {"chars", optional_argument, NULL, 'c'},
-  {"size", required_argument, NULL, 's'},
-  {"font", required_argument, NULL, 'f'},
-  {"bpp", optional_argument, NULL, 'b'},
-  {"mono", optional_argument, NULL, 'm'},
-  {NULL, 0, NULL, 0}
-};
-
-static void usage()
-{
-  fprintf(stderr, "\nttf2ugui {--show=\"Text\" | --dump} [--mono] [--dpi=displaydpi] [--bpp=bitsperpixel] [--chars=chars] --font=fontfile --size=fontsize\n\n");  
-  fprintf(stderr, "--dump : Create the C font file for uGUI\n");
-  fprintf(stderr, "--show : Prints an example text using uGUI and the rendered font. Only works with ASCII text.\n");
-  fprintf(stderr, "--dpi  : Sets the dpi. If not given, font size is assumed to be pixels.\n");
-  fprintf(stderr, "--bpp  : Sets bits per pixel, must be 1 or 8. Default is 1.\n");
-  fprintf(stderr, "--mono : Disables width table generation, saving some space. Non-monospaced fonts will look bad!\n");
-  fprintf(stderr, "--font : Specifies the font file to be used.\n");
-  fprintf(stderr, "--chars: ASCII or Unicode codes. Can be single and/or ranges in any combination. Needs ordering from lower to higher. Default is 32-126.\n");
-  fprintf(stderr, "         Ex. --chars=32-90,176,220-225 will generate chars from 32 to 90, single char 176 and chars from 220 to 225.\n");
-}
+#endif
 
 int main(int argc, char **argv)
 {
-  int ch;
+    static struct option lo[] = {
+        {"preview",    no_argument,       NULL, 'P'},
+        {"text",       required_argument, NULL, 't'},
+        {"dump",       no_argument,       NULL, 'D'},
+        {"dpi",        required_argument, NULL, 'd'},
+        {"chars",      required_argument, NULL, 'c'},
+        {"size",       required_argument, NULL, 's'},
+        {"font",       required_argument, NULL, 'f'},
+        {"bpp",        required_argument, NULL, 'b'},
+        {"list-faces", no_argument,       NULL, 'L'},
+        {"face-index", required_argument, NULL, 'i'},
+        {"weight",     required_argument, NULL, 'w'},
+        {"shadow",     required_argument, NULL, 'S'},
+        {"help",       no_argument,       NULL, 'h'},
+        {NULL,0,NULL,0}
+    };
 
-  while ((ch = getopt_long(argc, argv, "", longopts, NULL)) != -1) {
-
-    switch (ch) {
-    case 'f':
-      fontFile = optarg;
-      break;
-
-    case 'a':
-      showText = optarg;
-      break;
-
-    case 's':
-      sscanf(optarg, "%f", &fontSize);
-      break;
-
-    case 'd':
-      dpi = atoi(optarg);
-      break;
-
-    case 'b':
-      bpp = atoi(optarg);
-
-      if( (bpp !=1) && (bpp !=8) )
-      {
-        fprintf(stderr, "Bits per pixel must be 1 or 8. Default is 1.\n");
-        exit(1);
-      }
-      break;
-
-    case 'c':
-      charArg = optarg;
-      break;
-      
-    case 'm':
-      enable_widths=0;
-      break;
-
-    case 0:
-      break;
-
-    default:
-      usage();
-      exit(1);
+    int ch;
+    while ((ch = getopt_long(argc, argv, "", lo, NULL)) != -1) {
+        switch (ch) {
+        case 'P': opt_preview = 1; break;
+        case 't': opt_text    = optarg; break;
+        case 'D': opt_dump    = 1; break;
+        case 'd': dpi = atoi(optarg); break;
+        case 'c': opt_chars = optarg; break;
+        case 's': fontSize = (float)atof(optarg); break;
+        case 'f': opt_font = optarg; break;
+        case 'b': bpp = atoi(optarg);
+                  if (bpp != 1 && bpp != 8) { fprintf(stderr, "--bpp 1 or 8\n"); return 1; }
+                  break;
+        case 'L': opt_list_faces = 1; break;
+        case 'i': opt_face_index = atoi(optarg); break;
+        case 'w': opt_weight = atoi(optarg); break;
+        case 'S': opt_shadow = atoi(optarg) ? 1 : 0; break;
+        case 'h': usage(); return 0;
+        default:  usage(); return 1;
+        }
     }
-  }
 
-  argc -= optind;
-  argv += optind;
+    if (opt_list_faces) {
+        if (!opt_font) {
+            fprintf(stderr, "--list-faces requires --font=FILE\n");
+            return 1;
+        }
+        list_faces(opt_font);
+        return 0;
+    }
 
-  
-  if ((!dump && showText == NULL) || fontFile == NULL || fontSize == 0) {
+    char *opt_text_alloc = NULL;
+    #ifdef _WIN32
+        if (opt_text) {
+            char *u = ansi_to_utf8(opt_text);
+            if (u) { opt_text = u; opt_text_alloc = u; }
+        }
+    #endif
 
-    usage();
-    exit(1);
-  }
+    if (!opt_font || fontSize <= 0 || (!opt_dump && !opt_preview)) {
+        usage(); return 1;
+    }
+    if (opt_preview && !opt_text) {
+        fprintf(stderr, "--preview requires --text=TEXT\n");
+        return 1;
+    }
 
-  UG_FONT_DATA_RAM *font = convertFont(fontFile, dpi, fontSize,bpp);
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
-  if (showText)
-    showFont(font, showText);
+    CpVec cps = {0};
 
-  if (dump)
-    dumpFont(font, fontFile, fontSize,bpp);
+    parse_chars(&cps, opt_chars ? opt_chars : DEFAULT_CHARS);
+
+    Glyph *gs = NULL;
+    uint16_t maxw = 0, maxh = 0, notdef_adv = 0;
+    convert_font(opt_font, &cps, &gs, &maxw, &maxh, &notdef_adv);
+
+    sort_cps_glyphs(&cps, gs);
+
+    if (opt_preview)
+        render_preview(&cps, gs, maxh, opt_text, "preview.bmp");
+
+    if (opt_dump)
+        dump_font(opt_font, &cps, gs, maxw, maxh, notdef_adv);
+
+    for (uint32_t i = 0; i < cps.n; i++) free(gs[i].bitmap.p);
+    free(gs);
+    free(cps.cp);
+    free(opt_text_alloc);
+    return 0;
 }
