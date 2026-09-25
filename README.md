@@ -118,6 +118,9 @@ Custom character set
 
     ttf2ugui --font=arial.ttf --size=12 --bpp=1 --dump \
              --chars=32-126,160-255
+    ttf2ugui --font=SIMSUN2.TTC --dpi=75 --size=12 --bpp=1 \
+             --shadow=1 --dump --preview --text="您可以在" \
+             --chars=32-126,169,1042-1103,8208-8303,12289-12329,19968-40943,65281-65374
 
 Ranges accept `-` or `_` as the separator. Individual codepoints can be
 mixed with ranges. Only decimal is accepted; `0x` hex is not supported.

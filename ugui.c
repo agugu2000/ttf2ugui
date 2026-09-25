@@ -64,7 +64,7 @@ UG_S16 UG_Init( UG_GUI* g, UG_DEVICE *device )
    g->char_h_space = 1;
    g->char_v_space = 1;
    g->transparent_font = 0;
-   g->shadow_font = 1;
+   g->shadow_font = 0;
    g->font=NULL;
    g->currentFont.format = UG_FONT_FMT_OLD;
    g->currentFont.font_type = 0;
@@ -255,7 +255,7 @@ void UG_DrawRoundFrame( UG_S16 x1, UG_S16 y1, UG_S16 x2, UG_S16 y2, UG_S16 r, UG
      swap(x1,x2);
    if ( y2 < y1 )
      swap(y1,y2);
-
+   if(r) r++;               // Fix for corner radius looking weird, this makes the same outline as UG_FillRoundFrame
    if ( r > x2 ) return;
    if ( r > y2 ) return;
 
@@ -781,7 +781,11 @@ UG_CHAR _UG_DecodeUTF8(char **str) {
     (*str)++;
     while (bytes_left > 0) {
         c = **str;
-        if (c == 0 || (c & 0xC0) != 0x80) {
+        if (c == 0) {
+            /* Unexpected end of string, do not advance, let caller see '\0' */
+            return 0;
+        }
+        if ((c & 0xC0) != 0x80) {
             // Invalid continuation byte
             (*str)++;
             return -1;
@@ -1034,7 +1038,11 @@ static UG_S16 _UG_PutGlyph( UG_GLYPH *g, UG_S16 x, UG_S16 y, UG_COLOR fc, UG_COL
     /* ================= 1BPP fonts ================= */
     if (gui->currentFont.font_type == UG_FONT_TYPE_1BPP) {
 
-        /* ---------- Shadow pass: offset by (+1,+1), ink only ---------- */
+        /* ---------- Shadow pass: offset by (+1,+1), ink only ----------
+         * Note: shadow is only rendered on the non-accelerated path.
+         * When DRIVER_FILL_AREA is enabled, the shadow pass is skipped
+         * to keep the batched pixel-push logic simple.
+         */
         if (!driver && gui->shadow_font) {
             UG_COLOR shadow_color =
                 ((((fc & 0xFF)   * 128 + (bc & 0xFF)   * 128) >> 8) & 0xFF)   |
@@ -1470,7 +1478,7 @@ void _UG_PutText(UG_TEXT* txt)
              xp += adv + char_h_space;
              continue;
          }
-         _UG_PutGlyph(&g,xp,yp,txt->fc,txt->bc,1);
+         _UG_PutGlyph(&g,xp,yp,txt->fc,txt->bc,gui->transparent_font);
          xp += g.adv + char_h_space;
       }
       yp += char_height + char_v_space;
@@ -1588,16 +1596,18 @@ void _UG_SendObjectPostrenderEvent( UG_WINDOW *wnd, UG_OBJECT *obj )
 
 UG_U32 _UG_ConvertRGB565ToRGB888(UG_U16 c)
 {
-   UG_U32 r,g,b;
+   UG_U32 r, g, b;
 
-   r = (c&0xF800)<<8;
-   r += (r+7)>>5;
+   r = (c >> 11) & 0x1F;
+   r = (r << 3) | (r >> 2);
+   r <<= 16;
 
-   g = (c&0x7E0)<<5;
-   g += (g+3)>>6;
+   g = (c >> 5) & 0x3F;
+   g = (g << 2) | (g >> 4);
+   g <<= 8;
 
-   b = (c&0x1F)<<3;
-   b += (b+7)>>5;
+   b = c & 0x1F;
+   b = (b << 3) | (b >> 2);
 
    return (r | g | b);
 }
@@ -1704,32 +1714,12 @@ void UG_WaitForUpdate( void )
 
 void UG_DrawBMP( UG_S16 xp, UG_S16 yp, UG_BMP* bmp )
 {
-   UG_COLOR c;
    UG_S16 x,y;
 
    if ( bmp->p == NULL ) return;
 
-   if ( bmp->bpp == BMP_BPP_1){
-     UG_U8 xx,yy,b;
-     const UG_U8* p = (UG_U8*)bmp->p;         // This is untested !
-      for(y=0;y<bmp->height;y++)
-      {
-         for(x=0;x<bmp->width;x++)
-         {
-            yy = y / 8 ;
-            xx = y % 8;
-            b = p[x + yy * bmp->width];
-            xx = 1 << xx;
-            xx = xx & b;
-            if(xx) c = gui->fore_color;
-            else c = gui->back_color;
-            UG_DrawPixel( x + xp , y + yp , c );
-         }
-      }
-     return;
-   }
    #if defined UGUI_USE_COLOR_RGB888 || defined UGUI_USE_COLOR_RGB565
-   else if ( bmp->bpp == BMP_BPP_16){
+   if ( bmp->bpp == BMP_BPP_16){
 
      /* Is hardware acceleration available? */
 
@@ -2030,7 +2020,7 @@ UG_RESULT UG_WindowSetTitleTextFont( UG_WINDOW* wnd, UG_FONT* font )
       wnd->title.font = font;
       if ( wnd->title.height <= (UG_GetFontHeight(font) + 1) )
       {
-         wnd->title.height = UG_GetFontWidth(font) + 2;
+         wnd->title.height = UG_GetFontHeight(font) + 2;
          wnd->state &= ~WND_STATE_REDRAW_TITLE;
       }
       return UG_RESULT_OK;
@@ -2509,7 +2499,7 @@ static void _UG_WindowUpdate( UG_WINDOW* wnd )
    }
    else
    {
-      UG_FillFrame(wnd->xs,wnd->xs,wnd->xe,wnd->ye,gui->desktop_color);
+      UG_FillFrame(wnd->xs,wnd->ys,wnd->xe,wnd->ye,gui->desktop_color);
    }
 }
 
