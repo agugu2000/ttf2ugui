@@ -134,6 +134,25 @@ UG_U16 UG_GetFontHeight( UG_FONT* font )
    return (UG_U16)((p[4] << 8) | p[5]);
 }
 
+UG_S16 UG_GetFontAscender( UG_FONT* font )
+{
+   const UG_U8 *p = (const UG_U8 *)font;
+   if (p[0] & 0x80) return (UG_S16)p[2];
+   return (UG_S16)((p[16] << 8) | p[17]);
+}
+
+UG_S16 UG_GetFontDescender( UG_FONT* font )
+{
+   const UG_U8 *p = (const UG_U8 *)font;
+   if (p[0] & 0x80) return 0;
+   return (UG_S16)((p[18] << 8) | p[19]);
+}
+
+UG_S16 UG_GetFontLineHeight( UG_FONT* font )
+{
+   return UG_GetFontAscender(font) - UG_GetFontDescender(font);
+}
+
 /*
  * Sets the GUI font
  */
@@ -1038,23 +1057,6 @@ static UG_S16 _UG_PutGlyph( UG_GLYPH *g, UG_S16 x, UG_S16 y, UG_COLOR fc, UG_COL
     /* ================= 1BPP fonts ================= */
     if (gui->currentFont.font_type == UG_FONT_TYPE_1BPP) {
 
-        /* ---------- Shadow pass: offset by (+1,+1), ink only ----------
-         * Note: shadow is only rendered on the non-accelerated path.
-         * When DRIVER_FILL_AREA is enabled, the shadow pass is skipped
-         * to keep the batched pixel-push logic simple.
-         */
-        if (!driver && gui->shadow_font) {
-            UG_COLOR shadow_color =
-                ((((fc & 0xFF)   * 128 + (bc & 0xFF)   * 128) >> 8) & 0xFF)   |
-                ((((fc & 0xFF00) * 128 + (bc & 0xFF00) * 128) >> 8) & 0xFF00) |
-                ((((fc & 0xFF0000) * 128 + (bc & 0xFF0000) * 128) >> 8) & 0xFF0000);
-
-            _UG_BlitGlyph1BPP(g,
-                              draw_x + 1, draw_y + 1,
-                              shadow_color, shadow_color,
-                              1 /* ink only, no background */);
-        }
-
         /* ---------- Body pass ---------- */
         if (driver) {
             /* ---- Hardware acceleration: keep the original FILL_AREA logic ---- */
@@ -1146,11 +1148,35 @@ static UG_S16 _UG_PutGlyph( UG_GLYPH *g, UG_S16 x, UG_S16 y, UG_COLOR fc, UG_COL
                  gui->driver[DRIVER_FILL_AREA].driver)(-1, -1, -1, -1);
             }
         } else {
-            /* ---- No hardware acceleration: use the generic blit ---- */
+            /* ---- No hardware acceleration ----
+             * Draw order (mathematically correct):
+             *   1. background (bc) over whole bbox, if opaque
+             *   2. shadow ink, offset (+1,+1)
+             *   3. body ink, at (0,0), ink only (background already drawn in step 1)
+             */
+            if (!trans) {
+                UG_FillFrame(draw_x, draw_y,
+                             draw_x + (UG_S16)g->w - 1,
+                             draw_y + (UG_S16)g->h - 1,
+                             bc);
+            }
+
+            if (gui->shadow_font) {
+               UG_COLOR shadow_color =
+                  ((((fc & 0xFF)   * 64 + (bc & 0xFF)   * 192) >> 8) & 0xFF)   |
+                  ((((fc & 0xFF00) * 64 + (bc & 0xFF00) * 192) >> 8) & 0xFF00) |
+                  ((((fc & 0xFF0000) * 64 + (bc & 0xFF0000) * 192) >> 8) & 0xFF0000);
+
+                _UG_BlitGlyph1BPP(g,
+                                  draw_x + 1, draw_y + 1,
+                                  shadow_color, shadow_color,
+                                  1 /* ink only */);
+            }
+
             _UG_BlitGlyph1BPP(g,
                               draw_x, draw_y,
                               fc, bc,
-                              trans);
+                              1 /* ink only, background already drawn in step 1 */);
         }
     }
 #if defined(UGUI_USE_COLOR_RGB888) || defined(UGUI_USE_COLOR_RGB565)

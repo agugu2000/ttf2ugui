@@ -535,7 +535,9 @@ UG_U8 UG_FontGetShadow( void );
 /* Font metric helpers (functions, support both formats) */
 UG_U16 UG_GetFontWidth( UG_FONT* font );
 UG_U16 UG_GetFontHeight( UG_FONT* font );
-
+UG_S16 UG_GetFontAscender( UG_FONT* font );
+UG_S16 UG_GetFontDescender( UG_FONT* font );
+UG_S16 UG_GetFontLineHeight( UG_FONT* font );
 /* Miscellaneous functions */
 void UG_WaitForUpdate( void );
 void UG_Update( void );
