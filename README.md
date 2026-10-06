@@ -41,7 +41,7 @@ Changes from deividAlfa's version:
    now that the tool emits real Unicode codepoints, including CJK.
 
 7. Added `--list-faces` / `--face-index=N` for selecting a face inside a
-   TTC, and `--weight=N` for setting the `wght` axis of a variable font.
+   TTC, ~~and `--weight=N` for setting the `wght` axis of a variable font~~.
 
 8. Added `--shadow=0|1` (default 1) for 1BPP fonts, controlling the
    shadow pass drawn offset by (+1,+1) behind the glyph body in
@@ -63,9 +63,9 @@ Changes from deividAlfa's version:
     - `deps/ftmodule.h` selects the modules compiled in: sfnt, tt, cff,
       bdf, pcf, psnames, pshinter, psaux, smooth, raster1, autofit.
       This covers TTF, OTF, TTC, BDF and PCF inputs.
-    - `deps/ftoption.h` enables variable font support
+    - ~~`deps/ftoption.h` enables variable font support
       (`TT_CONFIG_OPTION_GX_VAR_SUPPORT`) for `--weight`, plus the
-      TrueType bytecode interpreter.
+      TrueType bytecode interpreter.~~
     - zlib, bzip2, png, harfbuzz and brotli are disabled to keep the
       binary small. Compressed fonts (`.ttf.gz`) are not supported.
 
@@ -81,7 +81,7 @@ CLI:
 
     ttf2ugui --font=FILE --size=N [--dpi=N] [--bpp=1|8] [--chars=LIST]
              [--dump] [--preview --text=TEXT]
-             [--list-faces] [--face-index=N] [--weight=N] [--shadow=0|1]
+             [--list-faces] [--face-index=N] ~~[--weight=N]~~ [--shadow=0|1]
 
 
 Examples
@@ -141,14 +141,14 @@ available faces first:
     ttf2ugui --font=SIMSUN2.TTC --list-faces
 
 
-Variable font weight
+~~Variable font weight
 --------------------
 
     ttf2ugui --font=Inter-Variable.ttf --size=16 --bpp=8 \
              --weight=700 --dump
 
 `--weight` sets the `wght` axis if the font has one. If the font is not
-variable or has no `wght` axis, the option is ignored with a note.
+variable or has no `wght` axis, the option is ignored with a note.~~
 
 
 Preview BMP

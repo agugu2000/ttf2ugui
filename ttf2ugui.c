@@ -64,7 +64,7 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
-#include FT_MULTIPLE_MASTERS_H
+// #include FT_MULTIPLE_MASTERS_H
 
 #include "ugui.h"
 
@@ -106,7 +106,7 @@ static char *opt_font = NULL;
 static char *opt_chars = NULL;
 static int   opt_list_faces  = 0;
 static int   opt_face_index  = 0;
-static int   opt_weight      = -1;   /* -1 = not set */
+// static int   opt_weight      = -1;   /* -1 = not set */
 static int   opt_shadow      = 1;
 
 typedef struct {
@@ -183,17 +183,17 @@ static void list_faces(const char *path)
         int weight = -1;
         if (face->style_flags & FT_STYLE_FLAG_BOLD) weight = 700;
 
-        /* Variable font weight axis default */
-        FT_MM_Var *mm = NULL;
-        if (FT_Get_MM_Var(face, &mm) == 0) {
-            for (FT_UInt a = 0; a < mm->num_axis; a++) {
-                if (mm->axis[a].tag == FT_MAKE_TAG('w','g','h','t')) {
-                    weight = (int)(mm->axis[a].def / 65536);
-                    break;
-                }
-            }
-            FT_Done_MM_Var(lib, mm);
-        }
+        // /* Variable font weight axis default */
+        // FT_MM_Var *mm = NULL;
+        // if (FT_Get_MM_Var(face, &mm) == 0) {
+        //     for (FT_UInt a = 0; a < mm->num_axis; a++) {
+        //         if (mm->axis[a].tag == FT_MAKE_TAG('w','g','h','t')) {
+        //             weight = (int)(mm->axis[a].def / 65536);
+        //             break;
+        //         }
+        //     }
+        //     FT_Done_MM_Var(lib, mm);
+        // }
 
         printf("face %ld: %s, style \"%s\"",
                i,
@@ -218,37 +218,18 @@ static void convert_font(const char *path, CpVec *cps, Glyph **out,
         fprintf(stderr, "FT face %d\n", err); exit(1);
     }
 
-    /* Variable font weight (only if --weight given and font has "wght" axis) */
-    if (opt_weight >= 0) {
-        FT_MM_Var *mm = NULL;
-        if (FT_Get_MM_Var(face, &mm) == 0) {
-            FT_UInt wght_idx = 0;
-            int found = 0;
-            for (FT_UInt a = 0; a < mm->num_axis; a++) {
-                if (mm->axis[a].tag == FT_MAKE_TAG('w','g','h','t')) {
-                    wght_idx = a;
-                    found = 1;
-                    break;
-                }
-            }
-            if (found) {
-                FT_Fixed coords[16] = {0};
-                FT_UInt n = mm->num_axis;
-                if (n > 16) n = 16;
-                for (FT_UInt a = 0; a < n; a++) coords[a] = mm->axis[a].def;
-                coords[wght_idx] = (FT_Fixed)opt_weight * 65536;
-                FT_Set_Var_Design_Coordinates(face, n, coords);
-            } else {
-                fprintf(stderr, "note: font has no 'wght' axis, --weight ignored\n");
-            }
-            FT_Done_MM_Var(lib, mm);
-        } else {
-            fprintf(stderr, "note: font is not variable, --weight ignored\n");
-        }
-    }
     if (dpi > 0) err = FT_Set_Char_Size(face, 0, (FT_F26Dot6)(fontSize * 64.0f), dpi, dpi);
     else         err = FT_Set_Pixel_Sizes(face, 0, (FT_UInt)fontSize);
     if (err) { fprintf(stderr, "FT size %d\n", err); exit(1); }
+
+    /* FreeType only auto-selects a Unicode charmap. Some fonts (e.g. FON/FNT)
+     * have FT_ENCODING_NONE charmap, leaving face->charmap == NULL, which
+     * makes FT_Get_Char_Index always return 0.
+     * If charmap was not selected, manually pick the first available one.
+     * Mirrors TextToPixel.cpp. */
+    if (!face->charmap && face->num_charmaps > 0) {
+        FT_Set_Charmap(face, face->charmaps[0]);
+    }
 
     /* Industry standard: font-wide metrics (read after FT_Set_*_Size) */
     int16_t ascender  = (int16_t)(face->size->metrics.ascender  >> 6);
@@ -258,7 +239,9 @@ static void convert_font(const char *path, CpVec *cps, Glyph **out,
     uint16_t notdef_adv = 0;
     {
         FT_UInt nd_idx = 0;
-        if (FT_Load_Glyph(face, nd_idx, FT_LOAD_RENDER | FT_LOAD_TARGET_MONO) == 0) {
+        if (FT_Load_Glyph(face, nd_idx, FT_LOAD_DEFAULT) == 0) {
+            if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
+                FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
             notdef_adv = (uint16_t)(face->glyph->advance.x >> 6);
         }
     }
@@ -282,11 +265,41 @@ static void convert_font(const char *path, CpVec *cps, Glyph **out,
             continue;
         }
 
-        FT_Int32 fl = (bpp == 8) ? (FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL | FT_LOAD_NO_BITMAP)
-                                 : (FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
-        if ((err = FT_Load_Char(face, cp, fl))) {
-            fprintf(stderr, "[error] U+%04X FT_Load_Char failed %d, skipped\n", cp, err);
-            continue;
+        /*   1. Try native bitmap (sbix, etc.) via FT_LOAD_SBITS_ONLY.
+         *   2. Fall back to FT_LOAD_DEFAULT.
+         *   3. If the result is already a bitmap, use it directly.
+         *   4. If outline, render in FT_RENDER_MODE_NORMAL (grayscale).
+         *   5. Anything else is unsupported.
+         *
+         * No FT_LOAD_TARGET_* and no FT_LOAD_NO_HINTING here.
+         * FT_LOAD_DEFAULT is intentional: it lets the font's own hinting
+         * (native bytecode interpreter, or autohinter if enabled) decide
+         * the rasterization, matching TextToPixel.cpp exactly.
+         */
+        FT_Error lerr;
+        lerr = FT_Load_Glyph(face, glyph_index, FT_LOAD_SBITS_ONLY);
+        if (!lerr && face->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
+            /* native bitmap, use as-is */
+        } else {
+            lerr = FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
+            if (lerr) {
+                fprintf(stderr, "[error] U+%04X FT_Load_Glyph failed %d, skipped\n", cp, lerr);
+                continue;
+            }
+
+            if (face->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
+                /* native bitmap (EBDT/EBLC etc.), use as-is */
+            } else if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+                lerr = FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
+                if (lerr) {
+                    fprintf(stderr, "[error] U+%04X FT_Render_Glyph failed %d, skipped\n", cp, lerr);
+                    continue;
+                }
+            } else {
+                fprintf(stderr, "[error] U+%04X unsupported glyph format %d, skipped\n",
+                        cp, face->glyph->format);
+                continue;
+            }
         }
 
         FT_Bitmap *bm = &face->glyph->bitmap;
@@ -314,22 +327,54 @@ static void convert_font(const char *path, CpVec *cps, Glyph **out,
 
         if (bpp == 1) {
             uint16_t bpr = (g->w + 7) / 8;
-            for (uint16_t y = 0; y < g->h; y++) {
-                for (uint16_t bx = 0; bx < bpr; bx++) {
-                    uint8_t outb = 0;
-                    for (uint8_t k = 0; k < 8; k++) {
-                        uint16_t x = bx * 8 + k;
-                        if (x >= g->w) break;
-                        uint8_t byte = bm->buffer[y * bm->pitch + (x >> 3)];
-                        if (byte & (0x80 >> (x & 7))) outb |= (1u << k);
+
+            if (bm->pixel_mode == FT_PIXEL_MODE_MONO) {
+                /* Native 1-bit bitmap: MSB-left in FreeType, emit LSB-left. */
+                for (uint16_t y = 0; y < g->h; y++) {
+                    const uint8_t *row = (bm->pitch >= 0)
+                        ? bm->buffer + (size_t)y * bm->pitch
+                        : bm->buffer + (size_t)(bm->rows - 1 - y) * (size_t)(-bm->pitch);
+                    for (uint16_t bx = 0; bx < bpr; bx++) {
+                        uint8_t outb = 0;
+                        for (uint8_t k = 0; k < 8; k++) {
+                            uint16_t x = bx * 8 + k;
+                            if (x >= g->w) break;
+                            uint8_t byte = row[x >> 3];
+                            if (byte & (0x80 >> (x & 7))) outb |= (1u << k);
+                        }
+                        bv_push(&g->bitmap, outb);
                     }
-                    bv_push(&g->bitmap, outb);
                 }
+            } else if (bm->pixel_mode == FT_PIXEL_MODE_GRAY) {
+                /* Grayscale rendered bitmap: threshold at 128, matching
+                 * TextToPixel.cpp's ExtractGrayBitmap. */
+                for (uint16_t y = 0; y < g->h; y++) {
+                    const uint8_t *row = (bm->pitch >= 0)
+                        ? bm->buffer + (size_t)y * bm->pitch
+                        : bm->buffer + (size_t)(bm->rows - 1 - y) * (size_t)(-bm->pitch);
+                    for (uint16_t bx = 0; bx < bpr; bx++) {
+                        uint8_t outb = 0;
+                        for (uint8_t k = 0; k < 8; k++) {
+                            uint16_t x = bx * 8 + k;
+                            if (x >= g->w) break;
+                            if (row[x] >= 128) outb |= (1u << k);
+                        }
+                        bv_push(&g->bitmap, outb);
+                    }
+                }
+            } else {
+                fprintf(stderr, "[error] U+%04X unsupported pixel_mode %d, skipped\n",
+                        cp, bm->pixel_mode);
+                continue;
             }
         } else {
-            for (uint16_t y = 0; y < g->h; y++)
+            for (uint16_t y = 0; y < g->h; y++) {
+                const uint8_t *row = (bm->pitch >= 0)
+                    ? bm->buffer + (size_t)y * bm->pitch
+                    : bm->buffer + (size_t)(bm->rows - 1 - y) * (size_t)(-bm->pitch);
                 for (uint16_t x = 0; x < g->w; x++)
-                    bv_push(&g->bitmap, bm->buffer[y * bm->pitch + x]);
+                    bv_push(&g->bitmap, row[x]);
+            }
         }
 
         cps_push(&cps_valid, cp);
@@ -884,7 +929,7 @@ static void usage(void)
         "  --text=TEXT     text to render into preview.bmp\n"
         "  --list-faces    list all faces in the font file and exit\n"
         "  --face-index=N  select face index N (default 0, for TTC)\n"
-        "  --weight=N      variable font weight (100-900), only for VF\n"
+        // "  --weight=N      variable font weight (100-900), only for VF\n"
         "  --shadow=N      1 = draw shadow (default), 0 = no shadow, 1BPP only\n");
 }
 
@@ -928,7 +973,7 @@ int main(int argc, char **argv)
         {"bpp",        required_argument, NULL, 'b'},
         {"list-faces", no_argument,       NULL, 'L'},
         {"face-index", required_argument, NULL, 'i'},
-        {"weight",     required_argument, NULL, 'w'},
+        // {"weight",     required_argument, NULL, 'w'},
         {"shadow",     required_argument, NULL, 'S'},
         {"help",       no_argument,       NULL, 'h'},
         {NULL,0,NULL,0}
@@ -949,7 +994,7 @@ int main(int argc, char **argv)
                   break;
         case 'L': opt_list_faces = 1; break;
         case 'i': opt_face_index = atoi(optarg); break;
-        case 'w': opt_weight = atoi(optarg); break;
+        // case 'w': opt_weight = atoi(optarg); break;
         case 'S': opt_shadow = atoi(optarg) ? 1 : 0; break;
         case 'h': usage(); return 0;
         default:  usage(); return 1;
